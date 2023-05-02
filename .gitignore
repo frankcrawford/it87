@@ -6,3 +6,5 @@
 
 /Module.symvers
 /modules.order
+
+.release/

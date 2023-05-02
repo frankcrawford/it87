@@ -1,0 +1,93 @@
+# Placeholder information will be used if not inserted above (e.g. by a build wrapper)
+_source_modname="${_source_modname:-"it87"}"
+_repo_name="${_repo_name:-"it87"}"
+_repo_owner="${_repo_owner:-"frankcrawford"}"
+_repo_commit="${_repo_commit:-"77abcbe0c49d7d8dc4530dcf51cecb40ef39f49a"}"
+_package_timestamp="${_package_timestamp:-"$(date '+%Y%m%d')"}"
+# 'source=' (no _ prefix) is expanded later in the script due to the default's reliance on other other variables. Override with filename only (no URL) to use local source file, local source is alongside the APKBUILD, remote source is downloaded to "./src", we have a check to account for that.
+# Placeholder information end
+
+pkgname="${_source_modname}-oot"
+pkgver=0_git${_package_timestamp}
+pkgrel=1
+pkgdesc="Userland package for the out-of-tree version of the \"${_source_modname}\" module forked by \"${_repo_owner}\""
+url="https://github.com/${_repo_owner}/${_repo_name}"
+arch="noarch"
+license="GPL-2.0-or-later"
+subpackages="
+	${pkgname}-akms:akms:x86_64
+	${pkgname}-doc:doc:noarch
+	${pkgname}-ignore_resource_conflict:ignore_resource_conflict:noarch"
+source=${source:-"${url}/tarball/${_repo_commit}/${_repo_name}.tar.gz"}
+options="!check"
+export install _source_dirname _source0
+
+
+prepare() {
+	default_prepare
+
+	# For some reason, akms doesn't remove the module after the package is uninstalled.
+	# So we do it via a post-deinstall script, this may become unnecessary in the future.
+	# This would error if the user uninstalled the module via "akms" prior to the package, hence "|| exit 0".
+	install -D -m 0755 <(printf '%s\n\n%s\n' '#!/bin/sh' "akms uninstall -k all '${pkgname}' || exit 0") "${startdir}/${pkgname}-akms.post-deinstall"
+	install="${pkgname}-akms.post-deinstall"
+
+	# Find where our source tarball is located, and set it as the _source0 variable similar to RPM's SOURCE0.
+	for i in "${PWD}" "${srcdir}"; do
+		[ -f "${i}/${_repo_name}.tar.gz" ] && _source0="${i}/${_repo_name}.tar.gz"
+	done
+
+	# Dynamically get the name of the directory inside the tarball (we expect it to be the only item in the tarball root).
+	_source_dirname="$(tar -tzf "${_source0}" | head -n 1 | head -c -2)"
+	[ -f "${srcdir}/${_source_dirname}/Makefile" ] || { echo "ERROR: Makefile not found in expected location"; exit 1; }
+
+	# This could theoretically be a problem, so we check for it to get a usable error message.
+	[ "${builddir##*/}" != "${_source_dirname}" ] || { echo "ERROR: builddir (from abuild) and _source_dirname (from tarball) are overlapping."; exit 1; }
+	mkdir -p "${builddir}" # It apparently isn't automatically created.
+	
+	printf '%s\n' "override ${_source_modname} * akms" >"${builddir}/depmod_${pkgname}.conf"
+	printf '%s\n' "${_source_modname}" >"${builddir}/modload_${pkgname}.conf"
+	printf '%s\n' "options ${_source_modname} ignore_resource_conflict" >"${builddir}/modprobe_${pkgname}.conf"
+
+	# We save the AKMBUILD externally so it is still available for the manual installation
+	# First we write the overrides, then append the original AKMBUILD.
+	printf '%s\n' \
+		"_source_modname='${_source_modname}'" \
+		"modver='${pkgver}'" \
+		>"${builddir}/akmbuild_${pkgname}"
+	cat "${srcdir}/${_source_dirname}/alpine/AKMBUILD" >>"${builddir}/akmbuild_${pkgname}"
+}
+
+package() {
+	depends="${pkgname}-akms" # Userland and akms packages depend on each other
+	
+	# Apparently Alpine only reads these files from /etc/, not the corresponding /usr/ locations
+	install -D -m 0644 "${builddir}/depmod_${pkgname}.conf" "${pkgdir}/etc/depmod.d/${pkgname}.conf"
+	install -D -m 0644 "${builddir}/modload_${pkgname}.conf" "${pkgdir}/etc/modules-load.d/${pkgname}.conf"
+
+	# We're supposed to let abuild handle the -doc package, it automatically moves /usr/share files into it.
+	install -D -m 0644 "${srcdir}/${_source_dirname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	install -D -m 0644 "${srcdir}/${_source_dirname}/README" "${pkgdir}/usr/share/doc/${pkgname}/README"
+	install -D -m 0644 "${srcdir}/${_source_dirname}/ISSUES" "${pkgdir}/usr/share/doc/${pkgname}/ISSUES"
+	install -D -m 0644 "${srcdir}/${_source_dirname}/debian/changelog" "${pkgdir}/usr/share/doc/${pkgname}/changelog"
+	cp -r "${srcdir}/${_source_dirname}/Sensors configs" "${pkgdir}/usr/share/doc/${pkgname}/Sensors configs"
+	# 'Research' is commented out because it's about 100x larger than the rest of the project files.
+	# cp -r "${srcdir}/${_source_dirname}/Research" "${pkgdir}/usr/share/doc/${pkgname}/Research"
+}
+
+akms() {
+	depends="
+		akms
+		${pkgname}
+		" # Depends on akms AND the userland package
+	pkgdesc="akms package for the out-of-tree version of the \"${_source_modname}\" module forked by \"${_repo_owner}\""
+	install -D -m 0644 "${builddir}/akmbuild_${pkgname}" "${subpkgdir}/usr/src/${pkgname}/AKMBUILD"
+	for i in "Makefile" "compat.h" "${_source_modname}.c" "LICENSE"; do
+		install -D -m 0644 "${srcdir}/${_source_dirname}/${i}" "${subpkgdir}/usr/src/${pkgname}/${i}"
+	done
+}
+
+ignore_resource_conflict() {
+	pkgdesc="Optional "modprobe.d" entry for the "${_source_modname}" module to ignore ACPI resource conflicts."
+	install -D -m 0644 "${builddir}/modprobe_${pkgname}.conf" "${subpkgdir}/etc/modprobe.d/${pkgname}.conf"
+}

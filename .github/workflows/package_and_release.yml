@@ -1,0 +1,137 @@
+name: 'Test, package and draft release'
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      master
+jobs:
+  build_and_test_apk:
+    uses: ./.github/workflows/packagetool.yml
+    with:
+      package_system: 'apk'
+      run_tests: true
+      produce_artifact: true
+      use_build_cache: true
+  build_and_test_deb:
+    uses: ./.github/workflows/packagetool.yml
+    with:
+      package_system: 'deb'
+      run_tests: true
+      produce_artifact: true
+      use_build_cache: true
+  build_and_test_rpm:
+    uses: ./.github/workflows/packagetool.yml
+    with:
+      package_system: 'rpm'
+      run_tests: true
+      produce_artifact: true
+      use_build_cache: true
+  prepare_release:
+    needs:
+      - build_and_test_apk
+      - build_and_test_deb
+      - build_and_test_rpm
+    runs-on: ubuntu-latest
+    env: 
+      CURL_BOILERPLATE: |
+        curl -fsSL -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "X-GitHub-Api-Version: 2022-11-28" \
+    steps:
+      - uses: actions/checkout@v3
+      - name: Gather variables
+        id: jobenv
+        run: |
+          current_time="$(date -u '+%s')"
+          printf 'HUMAN_TIME=%s\n' "$(date -u -d "@$current_time" '+%Y-%m-%d %H:%M:%SZ')" | tee "$GITHUB_OUTPUT"
+          printf 'GIT_TAG_TIME=%s\n' "$(date -u -d "@$current_time" '+%Y-%m-%dT%H_%M_%SZ')" | tee -a "$GITHUB_OUTPUT"
+          commit_time="$(git log -1 --pretty=%ct ${{ github.sha }})"
+          printf 'HUMAN_COMMIT_TIME=%s\n' "$(date -u -d "@$commit_time" '+%Y-%m-%d %H:%M:%SZ')" | tee -a "$GITHUB_OUTPUT"
+          printf 'COMMIT_MESSAGE=%s\n' "$(git log -1 --pretty=%s ${{ github.sha }})" | tee -a "$GITHUB_OUTPUT"
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts
+      - name: Create tarballs
+        run: |
+          mkdir -p /tmp/tarballs
+          for artifact_dir in /tmp/artifacts/*; do
+            artifact_name="${artifact_dir##*/}"
+            tar -C "$artifact_dir" -czvf "/tmp/tarballs/$artifact_name.tar.gz" .
+          done
+      - name: Create release draft
+        id: create_release
+        env:
+          RELEASE_TAG: snapshot-${{ steps.jobenv.outputs.GIT_TAG_TIME }}
+          RELEASE_TEXT_TITLE: Snapshot ${{ steps.jobenv.outputs.HUMAN_TIME }} - "${{ steps.jobenv.outputs.COMMIT_MESSAGE }}"
+          RELEASE_TEXT_BODY: |
+            Packaged commit: `${{ github.sha }}` from `${{ steps.jobenv.outputs.HUMAN_COMMIT_TIME }}`
+            # Asset contents:
+              - release-alpine-akms-apk.tar.gz
+                Module and supporting files as Alpine Linux '.apk' packages.
+              - release-alpine-akms-manual.tar.gz
+                Module and supporting files for Alpine Linux via manual installation.
+                - Note: `/etc/modprobe.d/it87-oot.conf` should only be installed if `ignore_resource_conflict` option is needed!
+              - release-debian-dkms-deb.tar.gz
+                Module as Debian '.deb' package.
+                - Note: Currently does not include package for `ignore_resource_conflict` option.
+              - release-redhat-akmods-rpm.tar.gz
+                Module and supporting files as Red Hat '.rpm' packages, also works with Fedora Silverblue & co.
+              - release-redhat-akmods-source-rpm.tar.gz
+                Source RPMs (for debugging and inspection).
+        run: |
+          release_json_data="$(jq -n \
+            --arg tag_name "$RELEASE_TAG" \
+            --arg tag_commitish "${{ github.sha }}" \
+            --arg name "$RELEASE_TEXT_TITLE" \
+            --arg body "$RELEASE_TEXT_BODY" \
+            --argjson draft true \
+            --argjson prerelease false \
+            '{ tag_name: $tag_name, target_commitish: $tag_commitish, name: $name, body: $body, draft: $draft, prerelease: $prerelease }'
+          )"
+          # If prerelease is true, the preview won't show in the sidebar on the repo's main page when published.
+          # Always insert strings with newlines, quotes, etc. as shell variables, not GH Actions contexts!
+          printf '%s\n' "-> Will send the following JSON data to the GitHub Releases API:"
+          printf '%s\n' "$release_json_data" | jq
+
+          latest_release="$(
+            ${{ env.CURL_BOILERPLATE }} "https://api.github.com/repos/${{ github.repository }}/releases?per_page=1"
+          )"
+          printf '%s\n' "-> Latest release:"
+          printf '%s\n' "$latest_release" | jq
+
+          # Should we create a new release or replace the latest draft? ('null' = no releases yet)
+          latest_release_is_draft="$(printf '%s\n' "$latest_release" | jq -r '.[0].draft')"
+          latest_release_is_snapshot="$(printf '%s\n' "$latest_release" | jq -r '.[0].tag_name' | grep -q '^snapshot-' && printf 'true' || printf 'false')"
+          printf '%s\n' "-> Is the latest release a draft? '$latest_release_is_draft'" "-> Is the latest release a snapshot? '$latest_release_is_snapshot'"
+
+          if [ "$latest_release_is_draft" == 'true' ] && [ "$latest_release_is_snapshot" == 'true' ]; then
+            printf '%s\n' "-> Replacing latest snapshot draft."
+            latest_release_id="$(printf '%s\n' "$latest_release" | jq -r '.[0].id')"
+            # We could update the latest release, but deleting and making a new one is more efficient.
+            ${{ env.CURL_BOILERPLATE }} "https://api.github.com/repos/${{ github.repository }}/releases/$latest_release_id" -X DELETE
+            api_response="$(
+              ${{ env.CURL_BOILERPLATE }} "https://api.github.com/repos/${{ github.repository }}/releases" -X POST -d "$release_json_data"
+            )"
+          else
+            printf '%s\n' "-> Creating new snapshot draft."
+            api_response="$(
+              ${{ env.CURL_BOILERPLATE }} "https://api.github.com/repos/${{ github.repository }}/releases" -X POST -d "$release_json_data"
+            )"
+          fi
+
+          printf '%s\n' "-> Response from the GitHub Releases API:"
+          printf '%s\n' "$api_response" | jq
+
+          # We need to remove the {?name,label} part from the upload_url
+          release_upload_url="$(printf '%s\n' "$api_response" | jq -r '.upload_url' | sed 's/{.*$//')"
+          printf 'RELEASE_UPLOAD_URL=%s\n' "$release_upload_url" | tee -a "$GITHUB_OUTPUT"
+      - name: Upload release assets
+        run: |
+          for tarball in /tmp/tarballs/*; do
+            tarball_name="${tarball##*/}"
+            printf '%s\n' "-> Uploading '$tarball_name'"
+            api_response="$(
+              ${{ env.CURL_BOILERPLATE }} "${{ steps.create_release.outputs.RELEASE_UPLOAD_URL }}?name=$tarball_name" -X POST -H "Content-Type: application/gzip" --data-binary "@$tarball"
+            )"
+            printf '%s\n' "-> Response from the GitHub Releases Assets API:"
+            printf '%s\n' "$api_response" | jq
+          done
