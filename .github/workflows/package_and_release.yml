@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      # If we don't specify a branch, the workflow will trigger itself when the release is published.
       master
 jobs:
   build_and_test_apk:
@@ -64,19 +65,19 @@ jobs:
           RELEASE_TEXT_TITLE: Snapshot ${{ steps.jobenv.outputs.HUMAN_TIME }} - "${{ steps.jobenv.outputs.COMMIT_MESSAGE }}"
           RELEASE_TEXT_BODY: |
             Packaged commit: `${{ github.sha }}` from `${{ steps.jobenv.outputs.HUMAN_COMMIT_TIME }}`
-            # Asset contents:
-              - release-alpine-akms-apk.tar.gz
-                Module and supporting files as Alpine Linux '.apk' packages.
-              - release-alpine-akms-manual.tar.gz
-                Module and supporting files for Alpine Linux via manual installation.
-                - Note: `/etc/modprobe.d/it87-oot.conf` should only be installed if `ignore_resource_conflict` option is needed!
-              - release-debian-dkms-deb.tar.gz
-                Module as Debian '.deb' package.
-                - Note: Currently does not include package for `ignore_resource_conflict` option.
-              - release-redhat-akmods-rpm.tar.gz
-                Module and supporting files as Red Hat '.rpm' packages, also works with Fedora Silverblue & co.
-              - release-redhat-akmods-source-rpm.tar.gz
-                Source RPMs (for debugging and inspection).
+            # Assets:
+            | Archive name | Contents | Notes |
+            | ------------ | -------- | ----- |
+            | `release-alpine-akms-apk.tar.gz` | Module and supporting files as Alpine Linux '.apk' packages. | |
+            | `release-alpine-akms-manual.tar.gz` | Module and supporting files for Alpine Linux via manual installation. | |
+            | `release-debian-dkms-deb.tar.gz` | Module as Debian '.deb' package. | Currently does not include package for `ignore_resource_conflict` option (can be configured manually in `/etc/modprobe.d/`). |
+            | `release-redhat-akmods-rpm.tar.gz` | Module and supporting files as Red Hat '.rpm' packages, also works with Fedora Silverblue & co. | |
+            | `release-redhat-akmods-source-rpm.tar.gz` | Source RPMs (for debugging and inspection). | |
+            # General information:
+            - For Alpine Linux with either method, installing the `linux-{flavor}-dev` (usually `linux-lts-dev`) package is recommended, otherwise `akms` will temporarily download it at the time of building, requiring an internet connection.
+            - The `ignore_resource_conflict` packages should only be installed if the module fails to load otherwise.
+              - In the manual Alpine Linux installation, `/etc/modprobe.d/it87-oot.conf` corresponds to the aforementioned package.
+            - A reboot is recommended after installing the module or (un)installing the `ignore_resource_conflict` package.
         run: |
           release_json_data="$(jq -n \
             --arg tag_name "$RELEASE_TAG" \

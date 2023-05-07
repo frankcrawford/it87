@@ -22,7 +22,7 @@ Package to ignore resource conflicts for the %{source_modname} kernel module.
 %prep
 %setup -q -c -T
 
-printf '%s\n' "options %{source_modname} ignore_resource_conflict" >"modprobe_%{name}.conf"
+printf '%s\n' "options %{source_modname} ignore_resource_conflict=true" >"modprobe_%{name}.conf"
 
 %install
 install -D -m 0644 "modprobe_%{name}.conf" "%{buildroot}%{_prefix}/lib/modprobe.d/%{name}.conf"

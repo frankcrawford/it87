@@ -1,6 +1,7 @@
 # Placeholder information will be used if not inserted above (e.g. by a build wrapper)
 %{!?source_modname: %global source_modname it87}
 %{!?repo_name: %global repo_name it87}
+# WARNING: This placeholder will download a very old version, ensure the repo info and commit hash are up-to-date
 %{!?repo_owner: %global repo_owner frankcrawford}
 %{!?repo_commit: %global repo_commit 77abcbe0c49d7d8dc4530dcf51cecb40ef39f49a}
 %{!?package_timestamp:%global package_timestamp %{lua:print(os.date('!%Y%m%d'))}}

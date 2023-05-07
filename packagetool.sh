@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -e
 software_name='it87' # Hardcoded default (see "gather_repo_info()")
+[ -f "./it87.c" ] || { printf '%s\n' "Error: Expected to find file './it87.c', this program should be run from inside the repository's root directory."; exit 1; }
 
 # -----------------
 # Utility functions
@@ -23,7 +24,7 @@ Options:
 		Inspect the container with a shell after building (and testing) the package.
 		Note: 'exit'-ing the container with a non-zero exit code will stop the script as well.
 	(Optional) --container_security_privileged
-		Run the container with the '--privileged' flag. Primarily needed by Docker for package tests.
+		Run the container with the '--privileged' flag. Sometimes required to run tests or when using SELinux.
 		TODO: More granular privileges
 	(Optional) --local_cache_dir=LOCAL_CACHE_DIR
 		Directory to use as a local cache for the build process.
@@ -219,7 +220,8 @@ print_repo_info() {
 
 container_build_and_run() {
 	container_name="${1}"
-	container_run_command="${2}"
+	# $local_cache_dir, $container_runtime, $inspect_container, $container_security_privileged and $containerfile are expected to be, if applicable, set by the caller.
+	# /run_script.sh is expected to be present in the container, likely via a bind mount.
 	
 	build_opts=()
 	if [ "$local_cache_dir" ] && [ "$container_runtime" == 'docker-buildx' ]; then
@@ -238,22 +240,23 @@ container_build_and_run() {
 	[ "$container_security_privileged" == 'true' ] && run_opts+=("--privileged")
 
 	case "$container_runtime" in
+		# Note: We currently don't "COPY" any files during build, nonetheless the $temp_dir is specified since the command wants a directory.
 		podman)
 			printf '%s\n' "${containerfile}" | podman build ${build_opts[@]} --tag "${container_name}" --file - ${temp_dir} ||
 				{ printf '%s\n' "Error: Failed to build '${container_name}' image."; exit 1; }
-			podman run ${run_opts[@]} --rm "${container_name}" ${container_run_command} ||
+			podman run ${run_opts[@]} --rm "${container_name}" '/run_script.sh' ||
 				{ printf '%s\n' "Error: '${container_name}' exited with non-zero status '$?'. Aborting."; exit 1; }
 			;;
 		docker)
 			printf '%s\n' "${containerfile}" | docker build ${build_opts[@]} --tag "${container_name}" --file - ${temp_dir} ||
 				{ printf '%s\n' "Error: Failed to build '${container_name}' image."; exit 1; }
-			docker run ${run_opts[@]} --rm "${container_name}" ${container_run_command} ||
+			docker run ${run_opts[@]} --rm "${container_name}" '/run_script.sh' ||
 				{ printf '%s\n' "Error: '${container_name}' exited with non-zero status '$?'. Aborting."; exit 1; }
 			;;
 		docker-buildx)
 			printf '%s\n' "${containerfile}" | docker buildx build ${build_opts[@]} --load --tag "${container_name}" --file - ${temp_dir} ||
 				{ printf '%s\n' "Error: Failed to build '${container_name}' image."; exit 1; }
-			docker run ${run_opts[@]} --rm "${container_name}" ${container_run_command} ||
+			docker run ${run_opts[@]} --rm "${container_name}" '/run_script.sh' ||
 				{ printf '%s\n' "Error: '${container_name}' exited with non-zero status '$?'. Aborting."; exit 1; }
 			;;
 		*) # container_runtime should be validated by the parser, so this should never happen.
@@ -373,10 +376,10 @@ build_apk() {
 	)
 	if [ "$container_run_pkg_tests" == 'true' ]; then
 		containerfile="$(printf '%s\n\n%s\n' "${containerfile}" "${containerfile_test}")" # Append test dependencies and setup
-		container_build_and_run "${software_name}-apk-build-and-test" "/run_script.sh"
+		container_build_and_run "${software_name}-apk-build-and-test"
 	else
 		containerfile="$(printf '%s\n' "${containerfile}")" # Add newline for consistency
-		container_build_and_run "${software_name}-apk-build" "/run_script.sh"
+		container_build_and_run "${software_name}-apk-build"
 	fi
 
 	# Prepare to copy out files
@@ -490,10 +493,10 @@ build_rpm() {
 	)
 	if [ "$container_run_pkg_tests" == 'true' ]; then
 		containerfile="$(printf '%s\n\n%s\n' "${containerfile}" "${containerfile_test}")" # Append test dependencies and setup
-		container_build_and_run "${software_name}-rpm-build-and-test" "/run_script.sh"
+		container_build_and_run "${software_name}-rpm-build-and-test"
 	else
 		containerfile="$(printf '%s\n' "${containerfile}")" # Add newline for consistency
-		container_build_and_run "${software_name}-rpm-build" "/run_script.sh"
+		container_build_and_run "${software_name}-rpm-build"
 	fi
 
 	# Copy out the built packages
@@ -551,10 +554,10 @@ build_deb() { # TODO: Support this packaging method like apk and rpm
 	)
 	if [ "$container_run_pkg_tests" == 'true' ]; then
 		containerfile="$(printf '%s\n\n%s\n' "${containerfile}" "${containerfile_test}")" # Append test dependencies and setup
-		container_build_and_run "${software_name}-deb-build-and-test" "/run_script.sh"
+		container_build_and_run "${software_name}-deb-build-and-test"
 	else
 		containerfile="$(printf '%s\n' "${containerfile}")" # Add newline for consistency
-		container_build_and_run "${software_name}-deb-build" "/run_script.sh"
+		container_build_and_run "${software_name}-deb-build"
 	fi	
 
 	# Copy out the built packages

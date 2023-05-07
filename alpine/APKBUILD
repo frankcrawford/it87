@@ -1,6 +1,7 @@
 # Placeholder information will be used if not inserted above (e.g. by a build wrapper)
 _source_modname="${_source_modname:-"it87"}"
 _repo_name="${_repo_name:-"it87"}"
+# WARNING: This placeholder will download a very old version, ensure the repo info and commit hash are up-to-date
 _repo_owner="${_repo_owner:-"frankcrawford"}"
 _repo_commit="${_repo_commit:-"77abcbe0c49d7d8dc4530dcf51cecb40ef39f49a"}"
 _package_timestamp="${_package_timestamp:-"$(date '+%Y%m%d')"}"
@@ -47,7 +48,7 @@ prepare() {
 	
 	printf '%s\n' "override ${_source_modname} * akms" >"${builddir}/depmod_${pkgname}.conf"
 	printf '%s\n' "${_source_modname}" >"${builddir}/modload_${pkgname}.conf"
-	printf '%s\n' "options ${_source_modname} ignore_resource_conflict" >"${builddir}/modprobe_${pkgname}.conf"
+	printf '%s\n' "options ${_source_modname} ignore_resource_conflict=true" >"${builddir}/modprobe_${pkgname}.conf"
 
 	# We save the AKMBUILD externally so it is still available for the manual installation
 	# First we write the overrides, then append the original AKMBUILD.
@@ -67,7 +68,7 @@ package() {
 
 	# We're supposed to let abuild handle the -doc package, it automatically moves /usr/share files into it.
 	install -D -m 0644 "${srcdir}/${_source_dirname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-	install -D -m 0644 "${srcdir}/${_source_dirname}/README" "${pkgdir}/usr/share/doc/${pkgname}/README"
+	install -D -m 0644 "${srcdir}/${_source_dirname}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README"
 	install -D -m 0644 "${srcdir}/${_source_dirname}/ISSUES" "${pkgdir}/usr/share/doc/${pkgname}/ISSUES"
 	install -D -m 0644 "${srcdir}/${_source_dirname}/debian/changelog" "${pkgdir}/usr/share/doc/${pkgname}/changelog"
 	cp -r "${srcdir}/${_source_dirname}/Sensors configs" "${pkgdir}/usr/share/doc/${pkgname}/Sensors configs"
