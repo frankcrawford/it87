@@ -132,6 +132,8 @@ parse_arguments() {
 				;;
 		esac
 	done
+
+	[ "$will_exit_with_ok" == 'false' ] || { printf '%s\n' "Info: A supplied option requests an early exit, exiting now"; exit 0; }
 	
 	# Set defaults
 	if [ ! "$container_run_pkg_tests" ]; then
@@ -158,24 +160,19 @@ parse_arguments() {
 		will_exit_with_err='true'
 	fi
 
-	case "$container_runtime" in
-		docker-buildx)
-			command -v docker &>/dev/null || { printf '%s\n' "Error: Container runtime 'docker' not found in PATH"; will_exit_with_err='true'; }
-			docker buildx version &>/dev/null || { printf '%s\n' "Error: 'docker buildx' plugin is not available"; will_exit_with_err='true'; }
-			;;
-		*)
-			command -v "$container_runtime" &>/dev/null || { printf '%s\n' "Error: Container runtime '$container_runtime' not found in PATH"; will_exit_with_err='true'; }
-			;;
-	esac
-	
-	# Exit modes
-	if [ "$will_exit_with_err" == 'true' ]; then
-		printf '%s\n' "Error: Exiting due to argument parsing error, see above for details"
-		exit 1
-	elif [ "$will_exit_with_ok" == 'true' ]; then
-		printf '%s\n' "Info: A supplied option requests an early exit, exiting now"
-		exit 0
+	if [ "$container_runtime" ]; then
+		case "$container_runtime" in
+			docker-buildx)
+				command -v docker &>/dev/null || { printf '%s\n' "Error: Container runtime 'docker' not found in PATH"; will_exit_with_err='true'; }
+				docker buildx version &>/dev/null || { printf '%s\n' "Error: 'docker buildx' plugin is not available"; will_exit_with_err='true'; }
+				;;
+			*)
+				command -v "$container_runtime" &>/dev/null || { printf '%s\n' "Error: Container runtime '$container_runtime' not found in PATH"; will_exit_with_err='true'; }
+				;;
+		esac
 	fi
+	
+	[ "$will_exit_with_err" == 'false' ] || { printf '%s\n' "Error: Exiting due to argument parsing error, see above for details"; exit 1; }
 }
 
 gather_repo_info() {

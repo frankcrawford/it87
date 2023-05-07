@@ -7,9 +7,6 @@ modname="${_source_modname}-oot"
 built_modules="${_source_modname}.ko"
 
 build() {
-	# TODO: automatically recommend installing build packages
-	# We need linux-{flavor}-dev and ???
-	# akms automatically (temporarily) downloads them when building, but this only works with a network connection.
 	for i in compat.h ${_source_modname}.c Makefile; do
 		cp "${srcdir}/${i}" "${builddir}/"
 	done

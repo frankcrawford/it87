@@ -36,7 +36,7 @@ The `it87` kernel module provides support for [certain ITE Super I/O chips](#sup
 # Module Parameters
 * `fix_pwm_polarity=`*\[bool\]*
 
-	If `true`, force PWM polarity to active high **(DANGEROUS)**. Some chips are misconfigured by BIOS - PWM values would be inverted. This option tries to fix this. Please contact your BIOS manufacturer and ask them for fix.
+	If `true`, force PWM polarity to active high **(DANGEROUS)**. Some chips are misconfigured by the motherboard firmware, causing PWM values to be inverted. This option tries to correct this. Please contact your motherboard manufacturer and ask them for a fix.
 
 * `force_id=`*\[short, short\]*
 
@@ -162,7 +162,7 @@ To change sensor N to a thermistor, 'echo 4 > tempN_type' where N is 1, 2, or 3.
 # Miscellaneous Information
 
 ## Fan speed control
-The fan speed control features are limited to manual PWM mode. Automatic "Smart Guardian" mode control handling is only implemented for older chips (see below.) However if you want to go for "manual mode" just write 1 to pwmN_enable.
+The fan speed control features are limited to manual PWM mode. Automatic "Smart Guardian" mode control handling is only implemented for older chips [(see below.)](#automatic-fan-speed-control-old-interface) However if you want to go for "manual mode" just write 1 to pwmN_enable.
 
 If you are only able to control the fan speed with very small PWM values, try lowering the PWM base frequency (pwm1_freq). Depending on the fan, it may give you a somewhat greater control range. The same frequency is used to drive all fan outputs, which is why pwm2_freq and pwm3_freq are read-only.
 
