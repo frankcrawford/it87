@@ -14,7 +14,7 @@ Options:
 		Print detected information about the current repository and exit.
 		The shown variables can be set manually in the environment or hardcoded in the script.
 	(Required) --container_runtime=CONTAINER_RUNTIME
-		Container runtime to use. Valid values are 'podman', 'docker', and 'docker-buildx.
+		Container runtime to use. Valid values are 'podman', 'docker', and 'docker-buildx'.
 	(Required) --package_system=PACKAGE_SYSTEM
 		Package system to target. Valid values are 'apk', 'deb', and 'rpm'.
 	(Optional) --run_build_tests
