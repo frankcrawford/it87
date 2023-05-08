@@ -54,5 +54,5 @@ A wrapper for GitHub Actions is provided in `./.github/workflows/packagetool.yml
 ## General information:
 - For Alpine Linux with either method, installing the `linux-{flavor}-dev` (usually `linux-lts-dev`) package is recommended, otherwise `akms` will temporarily download it at the time of building, requiring an internet connection.
 - The `ignore_resource_conflict` packages should only be installed if the module fails to load otherwise.
-- In the manual Alpine installation, `/etc/modprobe.d/it87-oot.conf` corresponds to the aforementioned package.
+	- In the manual Alpine installation, `/etc/modprobe.d/it87-oot.conf` corresponds to the aforementioned package.
 - A reboot is recommended after installing the module or (un)installing the `ignore_resource_conflict` package.
