@@ -73,6 +73,9 @@ jobs:
             | `release-debian-dkms-deb.tar.gz` | Module as Debian '.deb' package. | Currently does not include package for `ignore_resource_conflict` option (can be configured manually in `/etc/modprobe.d/`). |
             | `release-redhat-akmods-rpm.tar.gz` | Module and supporting files as Red Hat '.rpm' packages, also works with Fedora Silverblue & co. | |
             | `release-redhat-akmods-source-rpm.tar.gz` | Source RPMs (for debugging and inspection). | |
+			
+			For more information, please see ["Package Overview"](../HEAD/packagetool_quickstart.md#package-overview) in `packagetool_quickstart.md`.
+			
             # General information:
             - For Alpine Linux with either method, installing the `linux-{flavor}-dev` (usually `linux-lts-dev`) package is recommended, otherwise `akms` will temporarily download it at the time of building, requiring an internet connection.
             - The `ignore_resource_conflict` packages should only be installed if the module fails to load otherwise.
