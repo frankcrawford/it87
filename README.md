@@ -4,15 +4,16 @@ The `it87` kernel module provides support for [certain ITE Super I/O chips](#sup
 
 # Installing the module
 ## Installing with `make`
-### Basic Build & Install
+### Build
 1. `make clean`
 2. `make`
-3. `sudo make install`
 
-### Installing for DKMS
-1. `sudo make dkms`
-### Uninstalling from DKMS
-1. `sudo make dkms_clean`
+### Install for current kernel 
+- `sudo make install`
+### Install to DKMS
+- `sudo make dkms`
+### Remove from DKMS
+- `sudo make dkms_clean`
 
 ### Notes:
 * The module does not provide a real version number, so `git describe --long` is used to create one. This means that anything that changes the git state will change the version. `make dkms_clean` should be run before making a commit or an update with `git pull` as the Makefile is currently unable to track the last installed version to replace it. If this doesn't happen, the old version will need to be manually removed from dkms, before installing the updated module.
@@ -24,8 +25,7 @@ The `it87` kernel module provides support for [certain ITE Super I/O chips](#sup
 ## Installing as a package: `.apk` (AKMS)/`.rpm` (akmods)/`.deb` (DKMS)
 **Note:** `.apk` refers to Alpine Linux packages. The `.rpm` package also works with OSTree systems like Fedora Silverblue.
 
-* Pre-packaged versions can be found on the repo's releases page **[here](../../releases)**.
-
+* Pre-packaged versions via CI can be found on the repo's releases page: **[Latest Release](../../releases/latest)** (**[All Releases](../../releases)**, **[Workflow Status](../../actions)**)
 * A quick start guide for building packages locally can be found **[here](/packagetool_quickstart.md)**.
 
 ## Arch Linux AUR Package

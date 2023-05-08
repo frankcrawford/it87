@@ -36,7 +36,7 @@ A wrapper for GitHub Actions is provided in `./.github/workflows/packagetool.yml
 `./.github/workflows/package_and_release.yml` automatically builds and tests the packages, then creates a draft release with the packages as assets. It automatically replaces the latest draft release to avoid cluttering the releases page. If configured to be triggered by a push, it can be skipped by adding `[skip ci]` to the commit message (this is enforced by GitHub, not the workflow).
 
 # Package overview
-## Packages
+## Packages:
 | `package_system` | Package (`.release/*`) | Contents | Notes |
 | ------------------ | ------- | -------- | ----- |
 | `apk` | `apk/it87-oot-*.apk` | Userland files | Depends on AKMS package. |
@@ -44,19 +44,12 @@ A wrapper for GitHub Actions is provided in `./.github/workflows/packagetool.yml
 | `apk` | `apk/it87-oot-doc-*.apk` | Documentation files | |
 | `apk` | `apk/it87-ignore_resource_conflict-*.apk` | `ignore_resource_conflict` option | |
 | `apk` | `akms/*` | File system tree containing the files for manual installation | `/etc/modprobe.d/it87-oot.conf` is the `ignore_resource_conflict` option and should only be installed if needed |
+| `deb` | `it87-dkms_*.deb` | DKMS files | The `.deb` process is currently much more basic than the others, `ignore_resource_conflict` has to be manually configured in `/etc/modprobe.d/` |
 | `rpm` | `RPM/it87-oot-*.rpm` | Userland files | Depends on akmods package. |
 | `rpm` | `RPM/akmod-it87-oot-*.rpm` | akmods files | Depends on userland package. |
+| `rpm` | `RPM/kmod-it87-oot-*.rpm` | “Metapackage which tracks in the it87-oot kernel module for newest kernel” | I am not entirely sure what the point of this is since we’re building the module dynamically |
 | `rpm` | `RPM/it87-oot-ignore_resource_conflict-*.rpm` | `ignore_resource_conflict` option | |
-| `rpm` | `RPM/kmod-it87-oot-*.rpm` | "Metapackage which tracks in the it87-oot kernel module for newest kernel" | I am not entirely sure what the point of this is since we're building the module dynamically |
 | `rpm` | `SRPM/*` | Source RPMs (for debugging and inspection) | |
-| `deb` | `it87-dkms_*.deb` | DKMS files | The `.deb` process is currently much more basic than the others, `ignore_resource_conflict` has to be manually configured in `/etc/modprobe.d/` |
-<!-- | Archive name | Contents | Notes |
-| ------------ | -------- | ----- |
-| `release-alpine-akms-apk.tar.gz` | Module and supporting files as Alpine Linux '.apk' packages. | |
-| `release-alpine-akms-manual.tar.gz` | Module and supporting files for Alpine Linux via manual installation. | |
-| `release-debian-dkms-deb.tar.gz` | Module as Debian '.deb' package. | Currently does not include package for `ignore_resource_conflict` option (can be configured manually in `/etc/modprobe.d/`). |
-| `release-redhat-akmods-rpm.tar.gz` | Module and supporting files as Red Hat '.rpm' packages, also works with Fedora Silverblue & co. | |
-| `release-redhat-akmods-source-rpm.tar.gz` | Source RPMs (for debugging and inspection). | | -->
 
 ## General information:
 - For Alpine Linux with either method, installing the `linux-{flavor}-dev` (usually `linux-lts-dev`) package is recommended, otherwise `akms` will temporarily download it at the time of building, requiring an internet connection.
