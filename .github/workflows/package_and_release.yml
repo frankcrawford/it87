@@ -64,7 +64,7 @@ jobs:
           RELEASE_TAG: snapshot-${{ steps.jobenv.outputs.GIT_TAG_TIME }}
           RELEASE_TEXT_TITLE: Snapshot ${{ steps.jobenv.outputs.HUMAN_TIME }} - "${{ steps.jobenv.outputs.COMMIT_MESSAGE }}"
           RELEASE_TEXT_BODY: |
-            Packaged commit: `${{ github.sha }}` from `${{ steps.jobenv.outputs.HUMAN_COMMIT_TIME }}`
+            Packaged commit: [`${{ github.sha }}`](../../tree/${{ github.sha }}) from `${{ steps.jobenv.outputs.HUMAN_COMMIT_TIME }}`
             # Assets:
             | Archive name | Contents | Notes |
             | ------------ | -------- | ----- |
