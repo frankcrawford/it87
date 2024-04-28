@@ -1,0 +1,131 @@
+name: 'packagetool.sh wrapper'
+on:
+  workflow_call:
+    inputs:
+      package_system:
+        description: 'The package system to use'
+        required: true
+        type: string
+      run_tests:
+        description: 'Run tests after building the package'
+        required: false
+        default: true
+        type: boolean
+      produce_artifact:
+        description: 'Produce an artifact from the .release folder'
+        required: false
+        default: true
+        type: boolean
+      use_build_cache:
+        description: 'Use the weekly build cache'
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      package_system:
+        description: 'The package system to use'
+        required: true
+        type: choice
+        options:
+          - 'apk'
+          - 'deb'
+          - 'rpm'
+      run_tests:
+        description: 'Run tests after building the package'
+        required: false
+        default: true
+        type: boolean
+      produce_artifact:
+        description: 'Produce an artifact from the .release folder'
+        required: false
+        default: true
+        type: boolean
+      use_build_cache:
+        description: 'Use the weekly build cache'
+        required: false
+        default: true
+        type: boolean
+jobs:
+  packagetool:
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_SYSTEM: ${{ inputs.package_system }}
+      DOCKER_CACHE_DIR: ${{ format('/tmp/GitHubActions-DockerCache-{0}', inputs.package_system) }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up job environment
+        id: jobenv
+        run: |
+          printf 'CACHE_YEAR_AND_WEEK=%s\n' "$(date -u '+Y%YW%V')" | tee -a "$GITHUB_OUTPUT"
+          docker buildx create --name packagetool-builder --use
+          mkdir -p "${{ env.DOCKER_CACHE_DIR }}"
+      - name: GitHub Actions Cache for Docker (no tests)
+        # Note: We separate the caches since we don't want to end up saving a cache without the build dependencies, which
+        # tend to be the largest part of the cache. This could be handled better, but it would be unnecessarily complex.
+        # The problem is mainly that once created, GitHub actions caches are read only.
+        if: ${{ !inputs.run_tests && inputs.use_build_cache }}
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.DOCKER_CACHE_DIR }}
+          key: docker-cache-${{ env.PACKAGE_SYSTEM }}-lite-${{ steps.jobenv.outputs.CACHE_YEAR_AND_WEEK }}
+      - name: Run packagetool.sh (no tests)
+        # Note: For some reason we get "permission denied" when trying to delete the temp dir after running with Docker.
+        # Fortunately we have an option for that and it's fine since the filesystem doesn't persist between runs.
+        if: ${{ !inputs.run_tests }}
+        run: |
+          ./packagetool.sh \
+            --container_runtime=docker-buildx \
+            --package_system=${{ env.PACKAGE_SYSTEM }} \
+            $(if [ "${{ inputs.use_build_cache }}" == 'true' ]; then printf '%s' "--local_cache_dir=${{ env.DOCKER_CACHE_DIR }}"; fi) \
+            $(if [ "${{ inputs.use_build_cache }}" == 'true' ]; then printf '%s' "--local_cache_ci_mode"; fi) \
+            --keep_temp_dir \
+            --print_temp_dir=normal
+      - name: GitHub Actions Cache for Docker (with tests)
+        if: ${{ inputs.run_tests && inputs.use_build_cache }}
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.DOCKER_CACHE_DIR }}
+          key: docker-cache-${{ env.PACKAGE_SYSTEM }}-${{ steps.jobenv.outputs.CACHE_YEAR_AND_WEEK }}
+      - name: Run packagetool.sh (with tests)
+        if: ${{ inputs.run_tests }}
+        run: |
+          ./packagetool.sh \
+            --container_runtime=docker-buildx \
+            --package_system=${{ env.PACKAGE_SYSTEM }} \
+            --run_build_tests \
+            $(if [ "${{ inputs.use_build_cache }}" == 'true' ]; then printf '%s' "--local_cache_dir=${{ env.DOCKER_CACHE_DIR }}"; fi) \
+            $(if [ "${{ inputs.use_build_cache }}" == 'true' ]; then printf '%s' "--local_cache_ci_mode"; fi) \
+            --keep_temp_dir \
+            --container_security_privileged \
+            --print_temp_dir=normal
+      - name: Upload package artifact (alpine-akms-apk)
+        if: ${{ inputs.produce_artifact && inputs.package_system == 'apk' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-alpine-akms-apk
+          path: ./.release/apk
+      - name: Upload package artifact (alpine-akms-manual)
+        if: ${{ inputs.produce_artifact && inputs.package_system == 'apk' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-alpine-akms-manual
+          path: ./.release/akms
+      - name: Upload package artifact (debian-dkms-deb)
+        if: ${{ inputs.produce_artifact && inputs.package_system == 'deb' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-debian-dkms-deb
+          path: ./.release
+      - name: Upload package artifact (redhat-akmods-rpm)
+        if: ${{ inputs.produce_artifact && inputs.package_system == 'rpm' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-redhat-akmods-rpm
+          path: ./.release/RPMS
+      - name: Upload package artifact (redhat-akmods-source-rpm)
+        if: ${{ inputs.produce_artifact && inputs.package_system == 'rpm' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-redhat-akmods-source-rpm
+          path: ./.release/SRPMS

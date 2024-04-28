@@ -28,10 +28,10 @@ SYSTEM_MAP = /proc/kallsyms
 endif
 
 DRIVER := it87
+ifndef DRIVER_VERSION
 ifneq ("","$(wildcard .git/*)")
 DRIVER_VERSION := $(shell git describe --long).$(shell date -d "$(git show -s --format=%ci HEAD)" +%Y%m%d)
-else
-ifneq ("", "$(wildcard VERSION)")
+else ifneq ("", "$(wildcard VERSION)")
 DRIVER_VERSION := $(shell cat VERSION)
 else
 DRIVER_VERSION := unknown
