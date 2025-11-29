@@ -25,6 +25,9 @@
  *            IT8686E  Super I/O chip w/LPC interface
  *            IT8688E  Super I/O chip w/LPC interface
  *            IT8689E  Super I/O chip w/LPC interface
+ *            IT8696E  Super I/O chip w/LPC interface
+ *            IT8698E  Super I/O chip w/LPC interface
+ *            IT8668E  Super I/O chip w/LPC interface
  *            IT8705F  Super I/O chip w/LPC interface
  *            IT8712F  Super I/O chip w/LPC interface
  *            IT8716F  Super I/O chip w/LPC interface
@@ -56,19 +59,24 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/bitops.h>
+#include <linux/types.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/jiffies.h>
+#include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/hwmon-vid.h>
+#include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
+#include <linux/pci.h>
+#include <asm/processor.h>
 #include <linux/acpi.h>
 #include <linux/io.h>
 #include "compat.h"
@@ -83,18 +91,48 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 	     it8736, it8738,
 	     it8771, it8772, it8781, it8782, it8783, it8785, it8786, it8790,
 	     it8792, it8603, it8606, it8607, it8613, it8620, it8622, it8625,
-	     it8628, it8655, it8665, it8686, it8688, it8689, it87952, it8696 };
+	     it8628, it8655, it8665, it8686, it8688, it8689, it87952, it8696,
+	     it8698 };
 
 static struct platform_device *it87_pdev[2];
 
 #define	REG_2E	0x2e	/* The register to read/write */
 #define	REG_4E	0x4e	/* Secondary register to read/write */
 
-#define	DEV	0x07	/* Register: Logical device select */
-#define	PME	0x04	/* The device with the fan registers in it */
+#define	DEV	  0x07	/* Register: Logical device select */
+#define	PME	  0x04	/* The device with the fan registers in it */
+#define H2RAM 0x0f   /* The device with the H2RAM registers in it */
 
 /* The device with the IT8718F/IT8720F VID value in it */
 #define	GPIO	0x07
+
+/* Hybrid window access definitions */
+#define H2RAM_LOW_BOUND 0x800   /* Lower boundary for H2RAM window */
+#define H2RAM_HI_BOUND  0xfff   /* Upper boundary for H2RAM window*/
+
+/* Normal MMIO window upper boundary */
+#define MMIO_HI_BOUND   0x3ff   /* Normal MMIO upper boundary */
+
+/* Defines ECIO port access for ECIO */
+#define EXT_ECIO_EXTENT     5 /* Defines Port Range Reserved for ECIO*/
+#define ECIO_DATA       0x3f0 /* Data port for ECIO */
+#define ECIO_CMD_STAT   0x3f4 /* Command and status port for ECIO */
+#define ECIO_CMD_READ   0xb0  /* Command for reading data */
+#define ECIO_CMD_WRITE  0xb1  /* Command for writing data */
+#define ECIO_CMD_OBF    0x01  /* Status bit mask for output buffer is full */
+#define ECIO_CMD_IBF    0x02  /* Status bit mask for input buffer is full */
+#define ECIO_Burst_MASK 0x10  /* Status bit mask for burst tranfers */
+
+/* Timeouts and retries */
+#define ECIO_STEP_TIMEOUT   (HZ)  /* ~1 second per wait */
+#define ECIO_RETRIES        0     /* 0 = single attempt; bump if you want retries */
+
+/* Global ECIO lock: serialize all EC-IO access */
+static DEFINE_MUTEX(it87_ecio_lock);
+
+/* Defines vendor ID's for PCI to ISA bridges */
+#define IT87_H2_VENDOR_AMD     0x1022
+#define IT87_H2_VENDOR_INTEL   0x8086
 
 #define	DEVID	0x20	/* Register: Device ID */
 #define	DEVREV	0x22	/* Register: Device Revision */
@@ -156,6 +194,18 @@ static inline void superio_exit(int ioreg, bool noexit)
 	release_region(ioreg, 2);
 }
 
+/* PCI Read Routine */
+static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
+{
+    return pci_read_config_dword(d, off, v);
+}
+
+/* PCI Write Routine */
+static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
+{
+    return pci_write_config_dword(d, off, v);
+}
+
 /* Logical device 4 registers */
 #define IT8712F_DEVID 0x8712
 #define IT8705F_DEVID 0x8705
@@ -193,6 +243,7 @@ static inline void superio_exit(int ioreg, bool noexit)
 #define IT8689E_DEVID 0x8689
 #define IT87952E_DEVID 0x8695
 #define IT8696E_DEVID 0x8696
+#define IT8698E_DEVID 0x8698
 
 /* Logical device 4 (Environmental Monitor) registers */
 #define IT87_ACT_REG  0x30
@@ -215,6 +266,12 @@ static inline void superio_exit(int ioreg, bool noexit)
 #define IT87_SIO_SPI_REG	0xef	/* SPI function pin select */
 #define IT87_SIO_VID_REG	0xfc	/* VID value */
 #define IT87_SIO_BEEP_PIN_REG	0xf6	/* Beep pin mapping */
+
+/* Logical device F (SMFI/H2RAM) registers (IT8790E, IT8792E, IT87952E) */
+#define IT87_SMFI_ENABLE	0x30  /* SMFI enable Register (H2RAM support) */
+#define IT87_SMFI_BASE_LOW  0xf5  /* SMFI address low address & feat support */
+#define IT87_SMFI_BASE_HI   0xf6  /* SMFI address high byte */
+#define IT87_SMFI_BASE_EX   0xfc  /* SMFI register for 24 bit SMFI addresses */
 
 /* Force chip IDs to specified values. Should only be used for testing */
 static unsigned short force_id[2];
@@ -328,6 +385,8 @@ static const u8 IT87_REG_TEMP_LOW_8686[] = {
 #define IT87_REG_BEEP_ENABLE  0x5c
 
 #define IT87_REG_CHIPID       0x58
+/* Smartfan enable bit for it879x superios in MMIO*/
+#define IT87_SMARTFAN_ENABLE  0x947
 
 static const u8 IT87_REG_AUTO_BASE[] = { 0x60, 0x68, 0x70, 0x78, 0xa0, 0xa8 };
 
@@ -339,13 +398,13 @@ static const u8 IT87_REG_AUTO_BASE[] = { 0x60, 0x68, 0x70, 0x78, 0xa0, 0xa8 };
 static const u16 IT87_REG_TEMP_SRC1[] = { 0x21d, 0x21e, 0x21f };
 #define IT87_REG_TEMP_SRC2	0x23d
 
-#define NUM_VIN			ARRAY_SIZE(IT87_REG_VIN)
+#define NUM_VIN			    ARRAY_SIZE(IT87_REG_VIN)
 #define NUM_VIN_LIMIT		8
-#define NUM_TEMP		6
-#define NUM_FAN			ARRAY_SIZE(IT87_REG_FAN)
-#define NUM_FAN_DIV		3
-#define NUM_PWM			ARRAY_SIZE(IT87_REG_PWM)
-#define NUM_AUTO_PWM		ARRAY_SIZE(IT87_REG_PWM)
+#define NUM_TEMP		    6
+#define NUM_FAN			    ARRAY_SIZE(IT87_REG_FAN)
+#define NUM_FAN_DIV		    3
+#define NUM_PWM			    ARRAY_SIZE(IT87_REG_PWM)
+#define NUM_AUTO_PWM	    ARRAY_SIZE(IT87_REG_PWM)
 
 struct it87_devices {
 	const char *name;
@@ -368,11 +427,11 @@ struct it87_devices {
 #define FEAT_TEMP_OLD_PECI	BIT(6)
 #define FEAT_FAN16_CONFIG	BIT(7)	/* Need to enable 16-bit fans */
 #define FEAT_FIVE_FANS		BIT(8)	/* Supports five fans */
-#define FEAT_VID		BIT(9)	/* Set if chip supports VID */
+#define FEAT_VID		    BIT(9)	/* Set if chip supports VID */
 #define FEAT_IN7_INTERNAL	BIT(10)	/* Set if in7 is internal */
 #define FEAT_SIX_FANS		BIT(11)	/* Supports six fans */
 #define FEAT_10_9MV_ADC		BIT(12)
-#define FEAT_AVCC3		BIT(13)	/* Chip supports in9/AVCC3 */
+#define FEAT_AVCC3		    BIT(13)	/* Chip supports in9/AVCC3 */
 #define FEAT_FIVE_PWM		BIT(14)	/* Chip supports 5 pwm chn */
 #define FEAT_SIX_PWM		BIT(15)	/* Chip supports 6 pwm chn */
 #define FEAT_PWM_FREQ2		BIT(16)	/* Separate pwm freq 2 */
@@ -384,7 +443,7 @@ struct it87_devices {
  * second SIO address. Never exit configuration mode on these
  * chips to avoid the problem.
  */
-#define FEAT_NOCONF		BIT(19)	/* Chip conf mode enabled on startup */
+#define FEAT_NOCONF		    BIT(19)	/* Chip conf mode enabled on startup */
 #define FEAT_FOUR_FANS		BIT(20)	/* Supports four fans */
 #define FEAT_FOUR_PWM		BIT(21)	/* Supports four fan controls */
 #define FEAT_FOUR_TEMP		BIT(22)
@@ -392,7 +451,28 @@ struct it87_devices {
 #define FEAT_NEW_TEMPMAP	BIT(24)	/* new temp input selection */
 #define FEAT_BANK_SEL		BIT(25)	/* Chip has multi-bank support */
 #define FEAT_11MV_ADC		BIT(26)
-#define FEAT_MMIO		BIT(27)	/* Chip supports MMIO */
+/*
+ * MMIO access on chips seem to come in three flavors
+ * MMIO (FEAT_MMIO) Accesses a preconfigured memory space.
+ * (Initialized on Startup)
+ * MMIO (FEAT_BRIDGE_MMIO) with the mapping initialized on startup
+ * (Version supported by prior versions of it87)
+ * MMIO with a PCI to ISA bridge.
+ * (This requires us to configure the PCI to ISA bridges
+ * present in the system to allow access).
+ * MMIO (FEAT_MMIO_H2RAM) Device has H2RAM based MMIO Access.
+ * (H2RAM MMIO composes the base address differently than normal MMIO access).
+*/
+#define FEAT_MMIO		    BIT(27)	/* Chip supports MMIO */
+#define FEAT_BRIDGE_MMIO    BIT(28) /* Chip Supports PCI bridge based MMIO */
+#define FEAT_MMIO_H2RAM     BIT(29) /* Chip Supports H2RAM MMIO access */
+#define FEAT_H2RAM_EX_ADDR   BIT(30) /* Chip supports 24 bit H2RAM address */
+/*
+ * ECIO (FEAT_ECIO). Some chip configurations use a special I/O port pair
+ * to access H2RAM on AMD systems.
+ * Usually by checking if the SMFI_Enable Register is set to 0x00.
+*/
+#define FEAT_ECIO_H2RAM     BIT(31) /* Chip Supports H2RAM access via ECIO */
 
 static const struct it87_devices it87_devices[] = {
 	[it87] = {
@@ -601,7 +681,7 @@ static const struct it87_devices it87_devices[] = {
 		.features = FEAT_NEWER_AUTOPWM | FEAT_10_9MV_ADC
 		  | FEAT_16BIT_FANS | FEAT_TEMP_PECI
 		  | FEAT_IN7_INTERNAL | FEAT_PWM_FREQ2 | FEAT_FANCTL_ONOFF
-		  | FEAT_NOCONF,
+		  | FEAT_NOCONF | FEAT_MMIO_H2RAM,
 		.num_temp_limit = 3,
 		.num_temp_offset = 3,
 		.num_temp_map = 3,
@@ -613,7 +693,7 @@ static const struct it87_devices it87_devices[] = {
 		.features = FEAT_NEWER_AUTOPWM | FEAT_11MV_ADC
 		  | FEAT_16BIT_FANS | FEAT_TEMP_PECI
 		  | FEAT_IN7_INTERNAL | FEAT_PWM_FREQ2 | FEAT_FANCTL_ONOFF
-		  | FEAT_NOCONF,
+		  | FEAT_NOCONF | FEAT_MMIO_H2RAM | FEAT_ECIO_H2RAM,
 		.num_temp_limit = 3,
 		.num_temp_offset = 3,
 		.num_temp_map = 3,
@@ -757,7 +837,7 @@ static const struct it87_devices it87_devices[] = {
 		.features = FEAT_NEWER_AUTOPWM | FEAT_12MV_ADC | FEAT_16BIT_FANS
 		  | FEAT_SIX_FANS | FEAT_NEW_TEMPMAP
 		  | FEAT_IN7_INTERNAL | FEAT_SIX_PWM | FEAT_PWM_FREQ2
-		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3,
+		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3 | FEAT_BRIDGE_MMIO,
 		.num_temp_limit = 6,
 		.num_temp_offset = 6,
 		.num_temp_map = 7,
@@ -769,7 +849,7 @@ static const struct it87_devices it87_devices[] = {
 		.features = FEAT_NEWER_AUTOPWM | FEAT_12MV_ADC | FEAT_16BIT_FANS
 		  | FEAT_SIX_FANS | FEAT_NEW_TEMPMAP
 		  | FEAT_IN7_INTERNAL | FEAT_SIX_PWM | FEAT_PWM_FREQ2
-		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3,
+		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3 | FEAT_BRIDGE_MMIO,
 		.num_temp_limit = 6,
 		.num_temp_offset = 6,
 		.num_temp_map = 7,
@@ -781,19 +861,31 @@ static const struct it87_devices it87_devices[] = {
 		.features = FEAT_NEWER_AUTOPWM | FEAT_11MV_ADC
 		  | FEAT_16BIT_FANS | FEAT_TEMP_PECI
 		  | FEAT_IN7_INTERNAL | FEAT_PWM_FREQ2 | FEAT_FANCTL_ONOFF
-		  | FEAT_NOCONF,
+		  | FEAT_NOCONF | FEAT_MMIO_H2RAM | FEAT_H2RAM_EX_ADDR,
 		.num_temp_limit = 3,
 		.num_temp_offset = 3,
 		.num_temp_map = 3,
 		.peci_mask = 0x07,
 	},
-		[it8696] = {
+	[it8696] = {
 		.name = "it8696",
 		.model = "IT8696E",
 		.features = FEAT_NEWER_AUTOPWM | FEAT_12MV_ADC | FEAT_16BIT_FANS
 		  | FEAT_SIX_FANS | FEAT_NEW_TEMPMAP
 		  | FEAT_IN7_INTERNAL | FEAT_SIX_PWM | FEAT_PWM_FREQ2
-		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3,
+		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3 | FEAT_BRIDGE_MMIO,
+		.num_temp_limit = 6,
+		.num_temp_offset = 6,
+		.num_temp_map = 7,
+		.smbus_bitmap = BIT(1) | BIT(2),
+	},
+	[it8698] = {
+		.name = "it8698",
+		.model = "IT8698E",
+		.features = FEAT_NEWER_AUTOPWM | FEAT_12MV_ADC | FEAT_16BIT_FANS
+		  | FEAT_SIX_FANS | FEAT_NEW_TEMPMAP
+		  | FEAT_IN7_INTERNAL | FEAT_SIX_PWM | FEAT_PWM_FREQ2
+		  | FEAT_SIX_TEMP | FEAT_BANK_SEL | FEAT_AVCC3 | FEAT_BRIDGE_MMIO,
 		.num_temp_limit = 6,
 		.num_temp_offset = 6,
 		.num_temp_map = 7,
@@ -840,6 +932,10 @@ static const struct it87_devices it87_devices[] = {
 #define has_new_tempmap(data)	((data)->features & FEAT_NEW_TEMPMAP)
 #define has_bank_sel(data)	((data)->features & FEAT_BANK_SEL)
 #define has_mmio(data)		((data)->features & FEAT_MMIO)
+#define has_bridge_mmio(data)   ((data)->features & FEAT_BRIDGE_MMIO)
+#define has_h2ram_mmio(data)    ((data)->features & FEAT_MMIO_H2RAM)
+#define has_h2ram_ex_addr(data) ((data)->features & FEAT_H2RAM_EX_ADDR)
+#define has_h2ram_ecio(data)    ((data)->features & FEAT_ECIO_H2RAM)
 
 struct it87_sio_data {
 	enum chips type;
@@ -858,6 +954,10 @@ struct it87_sio_data {
 	u8 skip_temp;
 	u8 smbus_bitmap;
 	u8 ec_special_config;
+	/* mmio/ecio configuration flags */
+	bool mmio_h2ram;
+	bool ecio_h2ram;
+	bool mmio_bridge;
 };
 
 /*
@@ -876,7 +976,11 @@ struct it87_data {
 	u8 ec_special_config;	/* EC special config register restore value */
 	u8 sioaddr;		/* SIO port address */
 
-	void __iomem *mmio;	/* Remapped MMIO address if available */
+	void __iomem *mmio;	/* MMIO address if available */
+    bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
+    bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
+    bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
+
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
 
@@ -951,6 +1055,709 @@ struct it87_dmi_data {
 
 /* Global for results from DMI matching, if needed */
 static struct it87_dmi_data *dmi_data;
+
+/* MMIO PCI to ISA Bridge management struct */
+struct it87_h2ram_handle
+{
+    struct pci_dev *bridge;
+    bool            is_amd;
+    bool            is_intel;
+
+    /* Saved dwords we modify (captured once, restored in quiesce/release) */
+    u32 r48, r60, r6c;     /* AMD: 0x48 IoMemPortDecodeEnable, 0x60 range, 0x6C ROM range 2 */
+    u32 rd8, r98;          /* Intel: 0xD8 BIOSDecodeEnable, 0x98 LPCGenericMemoryRange */
+    bool saved;
+
+    /* Per-slot requested windows (idx 0=2E, 1=4E), 64KiB aligned */
+    u32 base[2];
+    u32 pages[2];          /* number of 64KiB pages (>=1) */
+    bool have[2];
+
+    /* AMD: track currently programmed base to minimize churn */
+    u32 current_base;
+};
+
+/* Global MMIO bridge state tracker */
+static struct it87_h2ram_handle it87_h2_global;
+static bool                    it87_h2_global_ready;
+/* Only call it87_h2_global_init() once from sm_it87_init() */
+static bool                    it87_h2_global_inited;
+
+/* Global MMIO mutex lock (serializes access to the bridge) */
+static DEFINE_MUTEX(mmio_lock);
+
+/* MMIO management enum */
+enum it87_mmio_state
+{
+    IT87_MMIO_ORIGINAL     = -1,
+    IT87_MMIO_DISABLED     = 0,
+    IT87_MMIO_ENABLED_2E   = 1,   /* slot 0 (SIO 0x2E) */
+    IT87_MMIO_ENABLED_4E   = 2,   /* slot 1 (SIO 0x4E) */
+    IT87_MMIO_ENABLED_BOTH = 3    /* Intel only */
+};
+
+/* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
+
+/* ----- Intel BIOSDecodeEnable mask helpers ----- */
+
+static u16 _intel_bios_mask_for_data_space(u32 base)
+{
+    if ((base & ~0xFFFFF) == 0xFF400000) return 0x0001;
+    if ((base & ~0xFFFFF) == 0xFF500000) return 0x0002;
+    if ((base & ~0xFFFFF) == 0xFF600000) return 0x0004;
+    if ((base & ~0xFFFFF) == 0xFF700000) return 0x0008;
+    if ((base & ~0xFFFF)  == 0x000E0000) return 0x0040;
+    if ((base & ~0xFFFF)  == 0x000F0000) return 0x0080;
+    if ((base & ~0x7FFFF) == 0xFFC00000) return 0x0100;
+    if ((base & ~0x7FFFF) == 0xFFC80000) return 0x0200;
+    if ((base & ~0x7FFFF) == 0xFFD00000) return 0x0400;
+    if ((base & ~0x7FFFF) == 0xFFD80000) return 0x0800;
+    if ((base & ~0x7FFFF) == 0xFFE00000) return 0x1000;
+    if ((base & ~0x7FFFF) == 0xFFE80000) return 0x2000;
+    if ((base & ~0x7FFFF) == 0xFFF00000) return 0x4000;
+    if ((base & ~0x7FFFF) == 0xFFF80000) return 0x8000;
+    return 0;
+}
+
+static u16 _intel_bios_mask_for_feat_space(u32 base)
+{
+    if ((base & ~0xFFFFF) == 0xFF000000) return 0x0001;
+    if ((base & ~0xFFFFF) == 0xFF100000) return 0x0002;
+    if ((base & ~0xFFFFF) == 0xFF200000) return 0x0004;
+    if ((base & ~0xFFFFF) == 0xFF300000) return 0x0008;
+    if ((base & ~0x7FFFF) == 0xFF800000) return 0x0100;
+    if ((base & ~0x7FFFF) == 0xFF880000) return 0x0200;
+    if ((base & ~0x7FFFF) == 0xFF900000) return 0x0400;
+    if ((base & ~0x7FFFF) == 0xFF980000) return 0x0800;
+    if ((base & ~0x7FFFF) == 0xFFA00000) return 0x1000;
+    if ((base & ~0x7FFFF) == 0xFFA80000) return 0x2000;
+    if ((base & ~0x7FFFF) == 0xFFB00000) return 0x4000;
+    if ((base & ~0x7FFFF) == 0xFFB80000) return 0x8000;
+    return 0;
+}
+
+/* ----- internal save/restore of original bridge state ----- */
+
+static void _save_regs(struct it87_h2ram_handle *h)
+{
+    u16 v;
+
+    if (!h || !h->bridge || h->saved)return;
+
+    v = h->bridge->vendor;
+    if (v==IT87_H2_VENDOR_AMD) {
+        pci_reg_read(h->bridge, 0x48, &h->r48);
+        pci_reg_read(h->bridge, 0x60, &h->r60);
+        pci_reg_read(h->bridge, 0x6c, &h->r6c);
+
+    } else if (v==IT87_H2_VENDOR_INTEL) {
+        pci_reg_read(h->bridge, 0xd8, &h->rd8);
+        pci_reg_read(h->bridge, 0x98, &h->r98);
+    }
+
+    h->saved = true;
+}
+
+static void _restore_regs(struct it87_h2ram_handle *h)
+{
+    u16 v;
+
+    if (!h || !h->bridge || !h->saved)return;
+
+    v = h->bridge->vendor;
+    if (v==IT87_H2_VENDOR_AMD) {
+        pci_reg_write(h->bridge, 0x48, h->r48);
+        pci_reg_write(h->bridge, 0x60, h->r60);
+        pci_reg_write(h->bridge, 0x6c, h->r6c);
+        h->current_base = 0;
+
+    } else if (v==IT87_H2_VENDOR_INTEL) {
+        pci_reg_write(h->bridge, 0xd8, h->rd8);
+        pci_reg_write(h->bridge, 0x98, h->r98);
+    }
+}
+
+/* ----- discrete per-slot programming ----- */
+
+/* AMD:
+ *  slot 0 (2E): START=(base>>16)&0xFF00; END=START+pages;
+ *               0x60=(END<<16)|START
+ *               0x6C: preserve upper 24 bits, clear low 8 (write back)
+ *               0x48: set bit5
+ *  slot 1 (4E): START=(base>>16)&0xFFFF; END=START+pages;
+ *               0x60=(END<<16)|START
+ *               0x6C=(0xFFFF0000 | END)
+ *               0x48: set bit5
+ */
+static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx, u32 base, u32 pages)
+{
+    u32 start, end, val;
+    int ret;
+
+    if (idx==0) {
+        start = ((base >> 16) & 0xFF00);
+    } else {
+        start = ((base >> 16) & 0xFFFF);
+    }
+    end = start + pages;
+
+    val = (end << 16) | (start & 0xFFFF);
+    ret = pci_reg_write(h->bridge, 0x60, val);
+    if (ret)return ret;
+
+    if (idx==0) {
+        u32 old6c;
+
+        ret = pci_reg_read(h->bridge, 0x6C, &old6c);
+        if (ret)return ret;
+        /* clear low 8 bits, keep upper 24 */
+        val = (old6c & 0xFFFFFF00);
+    } else {
+        val = 0xFFFF0000u | (end & 0xFFFF);
+    }
+    ret = pci_reg_write(h->bridge, 0x6C, val);
+    if (ret)return ret;
+
+    ret = pci_reg_read(h->bridge, 0x48, &val);
+    if (ret)return ret;
+    val |= BIT(5);
+    ret = pci_reg_write(h->bridge, 0x48, val);
+    if (ret)return ret;
+
+    h->current_base = base;
+    return 0;
+}
+
+/* Intel:
+ *  0x98: (START<<16)|1 with START=(base>>16)
+ *  0xD8: clear enable bit(s) (active-low):
+ *        - slot0: clear bit0
+ *        - slot1: clear one bit chosen from address tables (fallback 0x0001)
+ *  Both windows can remain enabled simultaneously.
+ */
+static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx, u32 base)
+{
+    u32 start = (base >> 16) & 0xFFFF;
+    u32 d;
+    int ret;
+
+    /* BIOSDecodeEnable */
+    ret = pci_reg_read(h->bridge, 0xD8, &d);
+    if (ret)return ret;
+
+    if (idx==0) {
+        d &= ~BIT(0);
+    } else {
+        u16 mask = _intel_bios_mask_for_data_space(base);
+
+        if (!mask)mask = _intel_bios_mask_for_feat_space(base);
+        if (!mask)mask = 0x0001;
+        d &= ~((u32)mask);
+    }
+    ret = pci_reg_write(h->bridge, 0xD8, d);
+    if (ret)return ret;
+
+    /* LPCGenericMemoryRange */
+    d = (start << 16) | 1u;
+    ret = pci_reg_write(h->bridge, 0x98, d);
+    if (ret)return ret;
+
+    return 0;
+}
+
+static int _enable_slot(struct it87_h2ram_handle *h, int idx, u32 base, u32 pages)
+{
+    u16 v;
+
+    if (!h || !h->bridge)return -ENODEV;
+    _save_regs(h);
+
+    v = h->bridge->vendor;
+    if (v==IT87_H2_VENDOR_AMD)return _amd_enable_slot(h, idx, base, pages);
+    if (v==IT87_H2_VENDOR_INTEL)return _intel_enable_slot(h, idx, base);
+    return -ENODEV;
+}
+
+/* ----- compact internal API (per-bridge handle) ----- */
+
+static int it87_h2_init(struct it87_h2ram_handle *h)
+{
+    struct pci_dev *pdev;
+
+    if (!h)return -EINVAL;
+
+    memset(h, 0, sizeof(*h));
+
+    pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
+    while (pdev) {
+        if (pdev->vendor==IT87_H2_VENDOR_AMD || pdev->vendor==IT87_H2_VENDOR_INTEL) {
+            int ret;
+
+            h->bridge = pdev;
+            pci_dev_get(h->bridge);
+            ret = pcim_enable_device(h->bridge);
+            pci_dev_put(pdev);
+            if (ret) {
+                h->bridge = NULL;
+                return ret;
+            }
+            h->is_amd   = (h->bridge->vendor==IT87_H2_VENDOR_AMD);
+            h->is_intel = (h->bridge->vendor==IT87_H2_VENDOR_INTEL);
+            return 0;
+        }
+        pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), pdev);
+    }
+    return -ENODEV;
+}
+
+static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base, u32 size)
+{
+    u32 base32, pages;
+
+    if (!h || !h->bridge)return -ENODEV;
+    if (idx<0 || idx>1)return -EINVAL;
+    if (mmio_base==0 || size==0)return -EINVAL;
+    if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
+
+    base32 = (u32)mmio_base;
+    base32 &= ~0xFFFFu;                        /* 64KiB align down */
+    if (size < 0x10000u)size = 0x10000u;
+    pages = (size + 0x10000u - 1) >> 16;       /* ceil(size/64KiB) */
+    if (pages==0)pages = 1;
+
+    h->base[idx]  = base32;
+    h->pages[idx] = pages;
+    h->have[idx]  = true;
+
+    return 0;
+}
+
+static int it87_h2_set_state(struct it87_h2ram_handle *h, enum it87_mmio_state st)
+{
+    int ret;
+
+    if (!h || !h->bridge)return -ENODEV;
+
+    if (st==IT87_MMIO_ORIGINAL || st==IT87_MMIO_DISABLED) {
+        _restore_regs(h);
+        return 0;
+    }
+
+    if (st==IT87_MMIO_ENABLED_2E) {
+        if (!h->have[0])return -EINVAL;
+        if (h->is_amd) {
+            if (h->current_base != h->base[0]) {
+                ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
+                if (ret)return ret;
+            }
+            return 0;
+        }
+        return _enable_slot(h, 0, h->base[0], h->pages[0]);
+    }
+
+    if (st==IT87_MMIO_ENABLED_4E) {
+        if (!h->have[1])return -EINVAL;
+        if (h->is_amd) {
+            if (h->current_base != h->base[1]) {
+                ret = _enable_slot(h, 1, h->base[1], h->pages[1]);
+                if (ret)return ret;
+            }
+            return 0;
+        }
+        return _enable_slot(h, 1, h->base[1], h->pages[1]);
+    }
+
+    if (st==IT87_MMIO_ENABLED_BOTH) {
+        if (!h->have[0] || !h->have[1])return -EINVAL;
+
+        if (h->is_amd) {
+            /* AMD cannot hold two simultaneously – pick slot 0 */
+            if (h->current_base != h->base[0]) {
+                ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
+                if (ret)return ret;
+            }
+            return 0;
+        }
+
+        /* Intel: enable both, order is not critical */
+        ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
+        if (ret)return ret;
+        ret = _enable_slot(h, 1, h->base[1], h->pages[1]);
+        if (ret)return ret;
+        return 0;
+    }
+
+    return -EINVAL;
+}
+
+static enum it87_mmio_state it87_h2_get_state(struct it87_h2ram_handle *h)
+{
+    if (!h || !h->bridge)return IT87_MMIO_ORIGINAL;
+
+    if (h->is_amd) {
+        if (h->current_base==0)return IT87_MMIO_ORIGINAL;
+        if (h->have[0] && h->current_base==h->base[0])return IT87_MMIO_ENABLED_2E;
+        if (h->have[1] && h->current_base==h->base[1])return IT87_MMIO_ENABLED_4E;
+        return IT87_MMIO_ORIGINAL;
+    }
+
+    if (h->have[0] && h->have[1])return IT87_MMIO_ENABLED_BOTH;
+    if (h->have[0])return IT87_MMIO_ENABLED_2E;
+    if (h->have[1])return IT87_MMIO_ENABLED_4E;
+    return IT87_MMIO_ORIGINAL;
+}
+
+static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
+{
+    if (!h || !h->bridge)return -ENODEV;
+    if (idx<0 || idx>1)return -EINVAL;
+    if (!h->have[idx])return -ENOENT;
+
+    if (h->is_amd) {
+        if (h->current_base != h->base[idx]) {
+            return _enable_slot(h, idx, h->base[idx], h->pages[idx]);
+        }
+        return 0;
+    }
+
+    /* Intel: already enabled by set_state or previous enables */
+    return 0;
+}
+
+static void it87_h2_release(struct it87_h2ram_handle *h)
+{
+    if (!h || !h->bridge)return;
+    _restore_regs(h);
+    pci_dev_put(h->bridge);
+    h->bridge = NULL;
+}
+
+/* ----- Global, locked API for shared MMIO bridge ----- */
+
+/* Called once from sm_it87_init(), after at least one it87_find()
+ * reported a valid mmio_address + mmio_bridge/mmio_h2ram.
+ */
+static int it87_h2_global_init(void)
+{
+    int ret;
+
+    mutex_lock(&mmio_lock);
+    ret = it87_h2_init(&it87_h2_global);
+    if (!ret)
+        it87_h2_global_ready = true;
+    mutex_unlock(&mmio_lock);
+
+    return ret;
+}
+
+/* Configure a slot (just updates state, does not touch PCI yet) */
+static int it87_h2_global_set_slot(int idx, u64 mmio_base, u32 size)
+{
+    int ret;
+
+    mutex_lock(&mmio_lock);
+    if (!it87_h2_global_ready) {
+        mutex_unlock(&mmio_lock);
+        return -ENODEV;
+    }
+    ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base, size);
+    mutex_unlock(&mmio_lock);
+
+    return ret;
+}
+
+/* Program bridge to a given state (this does PCI writes) */
+static int it87_h2_global_set_state(enum it87_mmio_state st)
+{
+    int ret;
+
+    mutex_lock(&mmio_lock);
+    if (!it87_h2_global_ready) {
+        mutex_unlock(&mmio_lock);
+        return -ENODEV;
+    }
+    ret = it87_h2_set_state(&it87_h2_global, st);
+    mutex_unlock(&mmio_lock);
+
+    return ret;
+}
+
+/* Query logical state (locked for consistency) */
+static enum it87_mmio_state it87_h2_global_get_state(void)
+{
+    enum it87_mmio_state st;
+
+    mutex_lock(&mmio_lock);
+    if (!it87_h2_global_ready)
+        st = IT87_MMIO_ORIGINAL;
+    else
+        st = it87_h2_get_state(&it87_h2_global);
+    mutex_unlock(&mmio_lock);
+
+    return st;
+}
+
+/* Ensure a specific slot is active (AMD may reprogram bridge) */
+static int it87_h2_global_use_slot(int idx)
+{
+    int ret;
+
+    mutex_lock(&mmio_lock);
+    if (!it87_h2_global_ready) {
+        mutex_unlock(&mmio_lock);
+        return -ENODEV;
+    }
+    ret = it87_h2_use_slot(&it87_h2_global, idx);
+    mutex_unlock(&mmio_lock);
+
+    return ret;
+}
+
+/* Fully release: restore PCI config and drop PCI ref */
+static void it87_h2_global_release(void)
+{
+    mutex_lock(&mmio_lock);
+    if (it87_h2_global_ready) {
+        it87_h2_release(&it87_h2_global);
+        it87_h2_global_ready  = false;
+        it87_h2_global_inited = false;
+    }
+    mutex_unlock(&mmio_lock);
+}
+
+
+
+/* ==== END: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
+
+/* ECIO H2RAM Access manager */
+/* ------------------------------------------------------------
+ * Low-level wait helpers (bus busy handling)
+ * ------------------------------------------------------------ */
+
+/*
+ * Wait for IBF == 0 (input buffer empty, EC ready to accept a byte).
+ * Returns 0 on success, -ETIMEDOUT on timeout.
+ */
+static int it87_ecio_wait_ibe(void)
+{
+    unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
+
+    while (time_before(jiffies, deadline)) {
+        u8 status = inb(ECIO_CMD_STAT);
+
+        /* IBF clear => we can write next byte */
+        if (!(status & ECIO_CMD_IBF))
+            return 0;
+
+        cpu_relax();
+        udelay(10);
+    }
+
+    return -ETIMEDOUT;
+}
+
+/*
+ * Wait for OBF == 1 (output buffer full, data ready to read).
+ * Returns 0 on success, -ETIMEDOUT on timeout.
+ */
+static int it87_ecio_wait_obf(void)
+{
+    unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
+
+    while (time_before(jiffies, deadline)) {
+        u8 status = inb(ECIO_CMD_STAT);
+
+        /* OBF set => data available in ECIO_DATA */
+        if (status & ECIO_CMD_OBF)
+            return 0;
+
+        cpu_relax();
+        udelay(10);
+    }
+
+    return -ETIMEDOUT;
+}
+
+/* ------------------------------------------------------------
+ * Single-attempt EC-IO transactions (no mutex, no retry)
+ * ------------------------------------------------------------ */
+
+/*
+ * Core read:
+ *   CMD_READ -> off_hi -> off_lo -> (wait OBF) -> read data
+ *
+ * offset must be >= 0x0100 (high byte non-zero).
+ */
+static int it87_ecio_read_once(u16 offset, u8 *value)
+{
+    int err;
+    u8 off_hi;
+    u8 off_lo;
+
+    if (!value)
+        return -EINVAL;
+
+    off_hi = (offset >> 8) & 0xFF;
+    off_lo = offset & 0xFF;
+
+    /* Enforce >= 0x0100 like the Python/Windows implementation */
+    if (off_hi == 0)
+        return -EINVAL;
+
+    /* CMD_READ */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(ECIO_CMD_READ, ECIO_CMD_STAT);
+
+    /* off_hi */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(off_hi, ECIO_DATA);
+
+    /* off_lo */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(off_lo, ECIO_DATA);
+
+    /* wait for data to appear */
+    err = it87_ecio_wait_obf();
+    if (err)
+        return err;
+
+    *value = inb(ECIO_DATA);
+    return 0;
+}
+
+/*
+ * Core write:
+ *   CMD_WRITE -> off_hi -> off_lo -> data
+ *
+ * offset must be >= 0x0100 (high byte non-zero).
+ */
+static int it87_ecio_write_once(u16 offset, u8 value)
+{
+    int err;
+    u8 off_hi;
+    u8 off_lo;
+
+    off_hi = (offset >> 8) & 0xFF;
+    off_lo = offset & 0xFF;
+
+    if (off_hi == 0)
+        return -EINVAL;
+
+    /* CMD_WRITE */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(ECIO_CMD_WRITE, ECIO_CMD_STAT);
+
+    /* off_hi */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(off_hi, ECIO_DATA);
+
+    /* off_lo */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(off_lo, ECIO_DATA);
+
+    /* data */
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
+    outb(value, ECIO_DATA);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------
+ * Public backend: mutex + (optional) retries + error handling
+ * ------------------------------------------------------------ */
+
+/*
+ * it87_ecio_read
+ *
+ *  - reg is the EC offset (0x0100..0xFFFF)
+ *  - Returns 0..255 (byte) on success
+ *  - On error, logs and returns 0xFF (to avoid breaking callers
+ *    that assume non-negative return is always a byte).
+ *
+ * If you later want “proper” errno propagation, change the tail
+ * to `return err;` and adjust call sites accordingly.
+ */
+static int _it87_ecio_read(struct it87_data *data, u16 reg)
+{
+    int attempt;
+    int err;
+    u8 value = 0;
+
+    (void)data;
+
+    mutex_lock(&it87_ecio_lock);
+
+    for (attempt=0; attempt<=ECIO_RETRIES; attempt++) {
+        err = it87_ecio_read_once(reg, &value);
+        if (!err) {
+            mutex_unlock(&it87_ecio_lock);
+            return value;
+        }
+
+        /* Only retry timeouts; other errors are hard failures */
+        if (err != -ETIMEDOUT)
+            break;
+
+        udelay(10000); /* 10 ms backoff */
+    }
+
+    mutex_unlock(&it87_ecio_lock);
+
+    pr_debug("it87: ECIO read failed at offset 0x%04x (err=%d)\n", reg, err);
+
+    /* Fallback safe value on error */
+    return 0xFF;
+}
+
+/*
+ * it87_ecio_write
+ *
+ *  - reg is the EC offset (0x0100..0xFFFF)
+ *  - value is the byte to write
+ *  - Errors are logged; no errno is returned to caller.
+ */
+static void _it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
+{
+    int attempt;
+    int err;
+
+    (void)data;
+
+    mutex_lock(&it87_ecio_lock);
+
+    for (attempt=0; attempt<=ECIO_RETRIES; attempt++) {
+        err = it87_ecio_write_once(reg, value);
+        if (!err) {
+            mutex_unlock(&it87_ecio_lock);
+            return;
+        }
+
+        if (err != -ETIMEDOUT)
+            break;
+
+        udelay(10000);
+    }
+
+    mutex_unlock(&it87_ecio_lock);
+
+    pr_debug("it87: ECIO write failed at offset 0x%04x (value=0x%02x, err=%d)\n",
+             reg, value, err);
+}
+/* End of ECIO H2RAM access manager */
 
 static int adc_lsb(const struct it87_data *data, int nr)
 {
@@ -1171,14 +1978,125 @@ static void it87_io_write(struct it87_data *data, u16 reg, u8 value)
 	it87_io_set_bank(data, bank);
 }
 
+/* ----- MMIO / hybrid backends ----- */
+
+/* Pure MMIO helper – no bridge logic here */
 static int it87_mmio_read(struct it87_data *data, u16 reg)
 {
-	return readb(data->mmio + reg);
+    return readb(data->mmio + reg);
 }
 
 static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 {
-	writeb(value, data->mmio + reg);
+    writeb(value, data->mmio + reg);
+}
+
+/* Pure MMIO via ISA bridge window (no hybrid I/O) */
+static int it87_bridge_read(struct it87_data *data, u16 reg)
+{
+    if (likely(data->mmio) &&
+       !(data->features & FEAT_MMIO) &&
+       it87_h2_global_ready &&
+       data->mmio_bridge) {
+        int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+
+        if (unlikely(it87_h2_global_use_slot(slot)))
+            return -EIO;
+    }
+
+    return it87_mmio_read(data, reg);
+}
+
+static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
+{
+    if (likely(data->mmio) &&
+       !(data->features & FEAT_MMIO) &&
+       it87_h2_global_ready &&
+       data->mmio_bridge) {
+        int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+
+        if (unlikely(it87_h2_global_use_slot(slot)))
+            return; /* best effort */
+    }
+
+    it87_mmio_write(data, reg, value);
+}
+
+/* Hybrid H2RAM access:
+ *   0x000–0x7FF : legacy EC I/O (banked)
+ *   0x800–0xFFF : MMIO via H2RAM window
+ */
+static int it87_h2ram_read(struct it87_data *data, u16 reg)
+{
+    if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
+        if (likely(data->mmio) &&
+           !(data->features & FEAT_MMIO) &&
+           it87_h2_global_ready &&
+           data->mmio_h2ram) {
+            int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+
+            if (unlikely(it87_h2_global_use_slot(slot)))
+                return -EIO;
+        }
+        /* High region: go through MMIO window */
+        return it87_bridge_read(data, reg);
+    }
+    /* Low region: conventional EC I/O path */
+    return _it87_io_read(data, reg);
+}
+
+static void it87_h2ram_write(struct it87_data *data, u16 reg, u8 value)
+{
+    if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
+        if (likely(data->mmio) &&
+           !(data->features & FEAT_MMIO) &&
+           it87_h2_global_ready &&
+           data->mmio_h2ram) {
+            int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+
+            if (unlikely(it87_h2_global_use_slot(slot)))
+                return; /* best effort */
+        }
+
+        /* High region: go through MMIO window */
+        it87_bridge_write(data, reg, value);
+        return;
+    }
+
+    /* Low region: conventional EC I/O path */
+    _it87_io_write(data, reg, value);
+}
+
+/* ECIO + Conventional I/O path */
+static int it87_ecio_read(struct it87_data *data, u16 reg)
+{
+    /* High region: go through ECIO window if hybrid ECIO is active */
+    if (reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND &&
+       likely(data->mmio) &&
+       !(data->features & FEAT_MMIO) &&
+       data->ecio_h2ram)
+    {
+        return _it87_ecio_read(data, reg);
+    }
+
+    /* Low region (or no ECIO hybrid): conventional EC I/O path */
+    return _it87_io_read(data, reg);
+}
+
+static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
+{
+    /* High region: go through ECIO window if hybrid ECIO is active */
+    if (reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND &&
+       likely(data->mmio) &&
+       !(data->features & FEAT_MMIO) &&
+       data->ecio_h2ram)
+    {
+        _it87_ecio_write(data, reg, value);
+        return;
+    }
+
+    /* Low region (or no ECIO hybrid): conventional EC I/O path */
+    _it87_io_write(data, reg, value);
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -1942,6 +2860,41 @@ static int check_trip_points(struct device *dev, int nr)
 	return err;
 }
 
+/* SmartFan global control in H2RAM:
+ *   0x00 = manual / non-automatic (any channel non-auto)
+ *   0x01 = automatic (all channels automatic)
+ *
+ * Only call this when data->mmio_h2ram or data->ecio_h2ram is true.
+ * For newer H2RAM based controllers with separate SmartFan toggle'
+ */
+static void it87_update_smartfan_global(struct it87_data *data)
+{
+    bool all_auto = true;
+    int  i;
+    u8   val;
+    int  cur;
+
+    for (i=0; i<NUM_AUTO_PWM; i++) {
+        /* Skip PWM channels that are not actually used/enabled */
+        if (!(data->has_pwm & BIT(i)))
+            continue;
+
+        /* pwm_mode(): 0 = full, 1 = manual, 2 = automatic */
+        if (pwm_mode(data, i) != 2) {
+            all_auto = false;
+            break;
+        }
+    }
+
+    val = all_auto ? 0x01 : 0x00;
+    cur = data->read(data,IT87_SMARTFAN_ENABLE);
+    if (cur >= 0 && (u8)cur == val)
+        return;
+    /* 0x947 is the SmartFan global control byte in H2RAM */
+    data->write(data, IT87_SMARTFAN_ENABLE, val);
+}
+
+
 static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
@@ -2017,6 +2970,12 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 				    data->fan_main_ctrl);
 		}
 	}
+
+	 /* If this device uses H2RAM/ECIO SmartFan, sync the global bit at 0x947 first */
+    if (data->mmio_h2ram || data->ecio_h2ram)
+    {
+        it87_update_smartfan_global(data);
+    }
 
 	it87_unlock(data);
 	return count;
@@ -3268,6 +4227,9 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 	case IT8696E_DEVID:
 		sio_data->type = it8696;
 		break;
+	case IT8698E_DEVID:
+		sio_data->type = it8698;
+		break;
 	case 0xffff:	/* No device at all */
 		goto exit;
 	default:
@@ -3305,16 +4267,58 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 
 	err = 0;
 	sio_data->revision = superio_inb(sioaddr, DEVREV) & 0x0f;
-
-	if (has_mmio(config) && mmio) {
+    /* Check for standard mmio support. If so, then compose base address*/
+	if ((has_mmio(config) || has_bridge_mmio(config)) && mmio) {
 		u8 reg;
 
 		reg = superio_inb(sioaddr, IT87_EC_HWM_MIO_REG);
 		if (reg & BIT(5)) {
 			base = 0xf0000000 + ((reg & 0x0f) << 24);
 			base += (reg & 0xc0) << 14;
+
+			if (has_bridge_mmio(config)) {
+			    sio_data->mmio_bridge = 1;
+			}
 		}
 	}
+    /* Check for H2RAM MMIO */
+	if (has_h2ram_mmio(config) && mmio) {
+		u8 enable;
+		u8 reg;
+        u8 reg1;
+        u8 reg2;
+        /* Select H2RAM (SMFI) configuration space */
+        superio_select(sioaddr, H2RAM);
+        /* Read SMFI enable register */
+        enable = superio_inb(sioaddr, IT87_SMFI_ENABLE);
+        /* If SMFI is enabled Read MMIO base address */
+        if (enable) {
+            reg  = superio_inb(sioaddr, IT87_SMFI_BASE_LOW);
+            reg1 = superio_inb(sioaddr, IT87_SMFI_BASE_HI);
+            /* If IT87952 compose 24 bit address */
+            if (has_h2ram_ex_addr(config)) {
+                reg2  = superio_inb(sioaddr, IT87_SMFI_BASE_EX);
+                base  = 0xFC000000;
+                base |= (u32)reg1 << 16;           /* F6 full       */
+                base |= (u32)(reg & 0xF0) << 12;   /* F5 high nib   */
+                base |= (u32)(reg2 & 0x0F) << 24;
+            }
+            /* If not IT87952 compose 16 bit address */
+            else {
+                base  = 0xFF000000;
+                base |= (u32)reg1 << 16;           /* F6 full       */
+                base |= (u32)(reg & 0xF0) << 12;
+            }
+            sio_data->mmio_h2ram = 1;
+        }
+        /* If SMFI is disabled check if has ECIO and on AMD, if so, then enable ECIO */
+        else if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && has_h2ram_ecio(config)) {
+            sio_data->ecio_h2ram = 1;
+        }
+
+        superio_select(sioaddr, PME);
+	}
+
 	*mmio_address = base;
 
 	mmio_str[0] = '\0';
@@ -3451,6 +4455,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 		case it8607:
 			sio_data->skip_pwm |= BIT(0);/* No fan1 */
 			sio_data->skip_fan |= BIT(0);
+			break;
 		default:
 			break;
 		}
@@ -3846,6 +4851,7 @@ static void it87_init_regs(struct platform_device *pdev)
 	case it8688:
 	case it8689:
 	case it8696:
+	case it8698:
 		data->REG_FAN = IT87_REG_FAN;
 		data->REG_FANX = IT87_REG_FANX;
 		data->REG_FAN_MIN = IT87_REG_FAN_MIN;
@@ -3898,10 +4904,26 @@ static void it87_init_regs(struct platform_device *pdev)
 		data->REG_TEMP_HIGH = IT87_REG_TEMP_HIGH;
 		break;
 	}
-
+	/* Sets various read/write routines for MMIO/ECIO devices *
+	 * it87_bridge_read/write use ISA bridge access to MMIO   *
+	 * it87_h2ram_read/write uses ISA brdge and conventional  *
+	 * I/O port access in the same memory space               *
+	 * it87_ecio_read/write uses ECIO (special ports) and     *
+	 * conventional I/O in the same memory space              */
 	if (data->mmio) {
-		data->read = it87_mmio_read;
-		data->write = it87_mmio_write;
+        if (data->mmio_bridge) {
+            data->read  = it87_bridge_read;
+            data->write = it87_bridge_write;
+        } else if (data->mmio_h2ram) {
+            data->read  = it87_h2ram_read;
+            data->write = it87_h2ram_write;
+        } else if (data->ecio_h2ram) {
+            data->read  = it87_ecio_read;
+            data->write = it87_ecio_write;
+        } else {
+		    data->read  = it87_mmio_read;
+		    data->write = it87_mmio_write;
+        }
 	} else if (has_bank_sel(data)) {
 		data->read = it87_io_read;
 		data->write = it87_io_write;
@@ -4054,6 +5076,7 @@ static void it87_init_device(struct platform_device *pdev)
 		case it8688:
 		case it8689:
 		case it8696:
+		case it8698:
 			if (tmp & BIT(2))
 				data->has_fan |= BIT(5); /* fan6 enabled */
 			break;
@@ -4079,6 +5102,7 @@ static void it87_init_device(struct platform_device *pdev)
 		case it8688:
 		case it8689:
 		case it8696:
+		case it8698:
 			tmp = data->read(data, IT87_REG_FAN_DIV);
 			if (!(tmp & BIT(3)))
 				sio_data->skip_pwm |= BIT(5);
@@ -4154,190 +5178,213 @@ static int it87_check_pwm(struct device *dev)
 
 static int it87_probe(struct platform_device *pdev)
 {
-	struct it87_data *data;
-	struct resource *res;
-	struct device *dev = &pdev->dev;
-	struct it87_sio_data *sio_data = dev_get_platdata(dev);
-	int enable_pwm_interface;
-	struct device *hwmon_dev;
-	int err;
+    struct it87_data      *data;
+    struct resource       *res_io;
+    struct resource       *res_mmio;
+    struct resource       *res_ecio;
+    struct device         *dev       = &pdev->dev;
+    struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
+    int                    enable_pwm_interface;
+    struct device         *hwmon_dev;
+    int                    err;
 
-	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
+    data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
 
-	res = platform_get_resource(pdev, IORESOURCE_IO, 0);
-	if (res) {
-		if (!devm_request_region(dev, res->start, IT87_EC_EXTENT,
+    /*
+     * Resource layout from it87_device_add():
+     *   IORESOURCE_IO  index 0: EC HWM window
+     *   IORESOURCE_IO  index 1: ECIO range
+     *   IORESOURCE_MEM index 0: MMIO/H2RAM window
+     */
+
+    /* Primary EC I/O window (always present) */
+    res_io = platform_get_resource(pdev, IORESOURCE_IO, 0);
+	if (res_io) {
+		if (!devm_request_region(dev, res_io->start, IT87_EC_EXTENT,
 					 DRVNAME)) {
-			dev_err(dev, "Failed to request region %pR\n", res);
+			dev_err(dev, "Failed to request Convetional IO region %pR\n", res_io);
 			return -EBUSY;
 		}
-	} else {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		data->mmio = devm_ioremap_resource(dev, res);
-		if (IS_ERR(data->mmio))
-			return PTR_ERR(data->mmio);
 	}
 
-	data->addr = res->start;
-	data->type = sio_data->type;
-	data->sioaddr = sio_data->sioaddr;
-	data->smbus_bitmap = sio_data->smbus_bitmap;
-	data->ec_special_config = sio_data->ec_special_config;
-	data->features = it87_devices[sio_data->type].features;
-	data->num_temp_limit = it87_devices[sio_data->type].num_temp_limit;
-	data->num_temp_offset = it87_devices[sio_data->type].num_temp_offset;
-	data->pwm_num_temp_map = it87_devices[sio_data->type].num_temp_map;
-	data->peci_mask = it87_devices[sio_data->type].peci_mask;
-	data->old_peci_mask = it87_devices[sio_data->type].old_peci_mask;
-	/*
-	 * IT8705F Datasheet 0.4.1, 3h == Version G.
-	 * IT8712F Datasheet 0.9.1, section 8.3.5 indicates 8h == Version J.
-	 * These are the first revisions with 16-bit tachometer support.
-	 */
-	switch (data->type) {
-	case it87:
-		if (sio_data->revision >= 0x03) {
-			data->features &= ~FEAT_OLD_AUTOPWM;
-			data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS;
-		}
-		break;
-	case it8712:
-		if (sio_data->revision >= 0x08) {
-			data->features &= ~FEAT_OLD_AUTOPWM;
-			data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS |
-					  FEAT_FIVE_FANS;
-		}
-		break;
-	default:
-		break;
-	}
-
-	platform_set_drvdata(pdev, data);
-
-	mutex_init(&data->update_lock);
-
-	/* Initialize register pointers */
-	it87_init_regs(pdev);
-
-	/*
-	 * We need to disable SMBus before we can read any registers in
-	 * the envmon address space, even if it is for chip identification
-	 * purposes. If the chip has SMBus client support, it likely also has
-	 * multi-page envmon registers, so we have to set the page anyway
-	 * before accessing those registers. Kind of a chicken-and-egg
-	 * problem.
-	 * Fortunately, the chip was already identified through the SIO
-	 * address space, only recent chips are affected, and this is just
-	 * an additional safeguard.
-	 */
-	err = smbus_disable(data);
-	if (err)
-		return err;
-
-	/* Now, we do the remaining detection. */
-	if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
-			data->read(data, IT87_REG_CHIPID) != 0x90) {
-		smbus_enable(data);
-		return -ENODEV;
-	}
-
-	/* Check PWM configuration */
-	enable_pwm_interface = it87_check_pwm(dev);
-	if (!enable_pwm_interface)
-		dev_info(dev,
-			 "Detected broken BIOS defaults, disabling PWM interface\n");
-
-	/* Starting with IT8721F, we handle scaling of internal voltages */
-	if (has_scaling(data)) {
-		if (sio_data->internal & BIT(0))
-			data->in_scaled |= BIT(3);	/* in3 is AVCC */
-		if (sio_data->internal & BIT(1))
-			data->in_scaled |= BIT(7);	/* in7 is VSB */
-		if (sio_data->internal & BIT(2))
-			data->in_scaled |= BIT(8);	/* in8 is Vbat */
-		if (sio_data->internal & BIT(3))
-			data->in_scaled |= BIT(9);	/* in9 is AVCC */
-	} else if (sio_data->type == it8781 || sio_data->type == it8782 ||
-		   sio_data->type == it8783) {
-		if (sio_data->internal & BIT(0))
-			data->in_scaled |= BIT(3);	/* in3 is VCC5V */
-		if (sio_data->internal & BIT(1))
-			data->in_scaled |= BIT(7);	/* in7 is VCCH5V */
-	}
-
-	data->has_temp = 0x07;
-	if (sio_data->skip_temp & BIT(2)) {
-		if (sio_data->type == it8782 &&
-		    !(data->read(data, IT87_REG_TEMP_EXTRA) & 0x80))
-			data->has_temp &= ~BIT(2);
-	}
-
-	data->in_internal = sio_data->internal;
-	data->need_in7_reroute = sio_data->need_in7_reroute;
-	data->has_in = 0x3ff & ~sio_data->skip_in;
-
-	if (has_four_temp(data)) {
-		data->has_temp |= BIT(3);
-	} else if (has_six_temp(data)) {
-		if (sio_data->type == it8655 || sio_data->type == it8665) {
-			data->has_temp |= BIT(3) | BIT(4) | BIT(5);
-		} else {
-			u8 reg = data->read(data, IT87_REG_TEMP456_ENABLE);
-
-			/* Check for additional temperature sensors */
-			if ((reg & 0x03) >= 0x02)
-				data->has_temp |= BIT(3);
-			if (((reg >> 2) & 0x03) >= 0x02)
-				data->has_temp |= BIT(4);
-			if (((reg >> 4) & 0x03) >= 0x02)
-				data->has_temp |= BIT(5);
-
-			/* Check for additional voltage sensors */
-			if ((reg & 0x03) == 0x01)
-				data->has_in |= BIT(10);
-			if (((reg >> 2) & 0x03) == 0x01)
-				data->has_in |= BIT(11);
-			if (((reg >> 4) & 0x03) == 0x01)
-				data->has_in |= BIT(12);
+    /* Extended EC I/O window */
+    res_ecio = platform_get_resource(pdev, IORESOURCE_IO, 1);
+	if (res_ecio) {
+		if (!devm_request_region(dev, res_ecio->start, EXT_ECIO_EXTENT,
+					 DRVNAME)) {
+			dev_err(dev, "Failed to request Extended ECIO region %pR\n", res_ecio);
+			return -EBUSY;
 		}
 	}
 
-	data->has_beep = !!sio_data->beep_pin;
+	/* Map Memory resources for MMIO */
+    res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (res_mmio)
+    {
+        data->mmio = devm_ioremap_resource(dev, res_mmio);
+        if (IS_ERR(data->mmio))
+            return PTR_ERR(data->mmio);
+    }
+    else
+    {
+        data->mmio = NULL;
+    }
 
-	/* Initialize the IT87 chip */
-	it87_init_device(pdev);
+    data->addr              = res_io->start;
+    data->type              = sio_data->type;
+    data->sioaddr           = sio_data->sioaddr;
+    data->smbus_bitmap      = sio_data->smbus_bitmap;
+    data->ec_special_config = sio_data->ec_special_config;
+    data->features          = it87_devices[sio_data->type].features;
+    data->num_temp_limit    = it87_devices[sio_data->type].num_temp_limit;
+    data->num_temp_offset   = it87_devices[sio_data->type].num_temp_offset;
+    data->pwm_num_temp_map  = it87_devices[sio_data->type].num_temp_map;
+    data->peci_mask         = it87_devices[sio_data->type].peci_mask;
+    data->old_peci_mask     = it87_devices[sio_data->type].old_peci_mask;
+    data->mmio_bridge       = sio_data->mmio_bridge;
+    data->mmio_h2ram        = sio_data->mmio_h2ram;
+    data->ecio_h2ram        = sio_data->ecio_h2ram;
 
-	smbus_enable(data);
+    switch(data->type)
+    {
+    case it87:
+        if (sio_data->revision >= 0x03)
+        {
+            data->features &= ~FEAT_OLD_AUTOPWM;
+            data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS;
+        }
+        break;
+    case it8712:
+        if (sio_data->revision >= 0x08)
+        {
+            data->features &= ~FEAT_OLD_AUTOPWM;
+            data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS |
+                              FEAT_FIVE_FANS;
+        }
+        break;
+    default:
+        break;
+    }
 
-	if (!sio_data->skip_vid) {
-		data->has_vid = true;
-		data->vrm = vid_which_vrm();
-		/* VID reading from Super-I/O config space if available */
-		data->vid = sio_data->vid_value;
-	}
+    platform_set_drvdata(pdev, data);
+    mutex_init(&data->update_lock);
 
-	/* Prepare for sysfs hooks */
-	data->groups[0] = &it87_group;
-	data->groups[1] = &it87_group_in;
-	data->groups[2] = &it87_group_temp;
-	data->groups[3] = &it87_group_fan;
+    /* Initialize register accessors (select IO vs MMIO backend) */
+    it87_init_regs(pdev);
 
-	if (enable_pwm_interface) {
-		data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
-		data->has_pwm &= ~sio_data->skip_pwm;
+    /* Disable SMBus shadowing while probing sensor blocks */
+    err = smbus_disable(data);
+    if (err)
+        return err;
 
-		data->groups[4] = &it87_group_pwm;
-		if (has_old_autopwm(data) || has_newer_autopwm(data))
-			data->groups[5] = &it87_group_auto_pwm;
-	}
+    if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
+       data->read(data, IT87_REG_CHIPID) != 0x90)
+    {
+        smbus_enable(data);
+        return -ENODEV;
+    }
 
-	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
-					it87_devices[sio_data->type].name,
-					data, data->groups);
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+    enable_pwm_interface = it87_check_pwm(dev);
+    if (!enable_pwm_interface)
+        dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
+
+    if (has_scaling(data))
+    {
+        if (sio_data->internal & BIT(0))
+            data->in_scaled |= BIT(3);   /* in3 is AVCC */
+        if (sio_data->internal & BIT(1))
+            data->in_scaled |= BIT(7);   /* in7 is VSB */
+        if (sio_data->internal & BIT(2))
+            data->in_scaled |= BIT(8);   /* in8 is Vbat */
+        if (sio_data->internal & BIT(3))
+            data->in_scaled |= BIT(9);   /* in9 is AVCC */
+    }
+    else if (sio_data->type == it8781 || sio_data->type == it8782 || sio_data->type == it8783)
+    {
+        if (sio_data->internal & BIT(0))
+            data->in_scaled |= BIT(3);   /* in3 is VCC5V */
+        if (sio_data->internal & BIT(1))
+            data->in_scaled |= BIT(7);   /* in7 is VCCH5V */
+    }
+
+    data->has_temp = 0x07;
+    if (sio_data->skip_temp & BIT(2))
+    {
+        if (sio_data->type == it8782 &&
+           !(data->read(data, IT87_REG_TEMP_EXTRA) & 0x80))
+            data->has_temp &= ~BIT(2);
+    }
+
+    data->in_internal      = sio_data->internal;
+    data->need_in7_reroute = sio_data->need_in7_reroute;
+    data->has_in           = 0x3ff & ~sio_data->skip_in;
+
+    if (has_four_temp(data))
+    {
+        data->has_temp |= BIT(3);
+    }
+    else if (has_six_temp(data))
+    {
+        if (sio_data->type == it8655 || sio_data->type == it8665)
+        {
+            data->has_temp |= BIT(3) | BIT(4) | BIT(5);
+        }
+        else
+        {
+            u8 reg = data->read(data, IT87_REG_TEMP456_ENABLE);
+
+            if ((reg & 0x03) >= 0x02)
+                data->has_temp |= BIT(3);
+            if (((reg >> 2) & 0x03) >= 0x02)
+                data->has_temp |= BIT(4);
+            if (((reg >> 4) & 0x03) >= 0x02)
+                data->has_temp |= BIT(5);
+
+            if ((reg & 0x03) == 0x01)
+                data->has_in |= BIT(10);
+            if (((reg >> 2) & 0x03) == 0x01)
+                data->has_in |= BIT(11);
+            if (((reg >> 4) & 0x03) == 0x01)
+                data->has_in |= BIT(12);
+        }
+    }
+
+    data->has_beep = !!sio_data->beep_pin;
+
+    it87_init_device(pdev);
+
+    smbus_enable(data);
+
+    if (!sio_data->skip_vid)
+    {
+        data->has_vid = true;
+        data->vrm     = vid_which_vrm();
+        data->vid     = sio_data->vid_value;
+    }
+
+    data->groups[0] = &it87_group;
+    data->groups[1] = &it87_group_in;
+    data->groups[2] = &it87_group_temp;
+    data->groups[3] = &it87_group_fan;
+
+    if (enable_pwm_interface)
+    {
+        data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
+        data->has_pwm &= ~sio_data->skip_pwm;
+
+        data->groups[4] = &it87_group_pwm;
+        if (has_old_autopwm(data) || has_newer_autopwm(data))
+            data->groups[5] = &it87_group_auto_pwm;
+    }
+
+    hwmon_dev = devm_hwmon_device_register_with_groups(dev,
+                             it87_devices[sio_data->type].name,
+                             data, data->groups);
+    return PTR_ERR_OR_ZERO(hwmon_dev);
 }
+
 
 static void it87_resume_sio(struct platform_device *pdev)
 {
@@ -4412,62 +5459,111 @@ static struct platform_driver it87_driver = {
 };
 
 static int __init it87_device_add(int index, unsigned short sio_address,
-				  phys_addr_t mmio_address,
-				  const struct it87_sio_data *sio_data)
+                                  phys_addr_t mmio_address,
+                                  const struct it87_sio_data *sio_data)
 {
-	struct platform_device *pdev;
-	struct resource res = {
-		.name	= DRVNAME,
-	};
-	int err;
+    struct platform_device *pdev;
+    struct resource res[3];
+    int nres = 0;
+    int err;
 
-	if (mmio_address) {
-		res.start = mmio_address;
-		res.end  = mmio_address + 0x400 - 1;
-		res.flags = IORESOURCE_MEM;
-	} else {
-		res.start = sio_address + IT87_EC_OFFSET;
-		res.end  = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
-		res.flags = IORESOURCE_IO;
-	}
+    memset(res, 0, sizeof(res));
 
-	err = acpi_check_resource_conflict(&res);
-	if (err) {
-		if (dmi_data && dmi_data->skip_acpi_res)
-			pr_info("Ignoring expected ACPI resource conflict\n");
-		else if (!ignore_resource_conflict)
-			return err;
-	}
+    /*
+     * 1) Primary EC I/O window (always present, always ACPI-checked)
+     */
+    res[nres].name  = DRVNAME;
+    res[nres].start = sio_address + IT87_EC_OFFSET;
+    res[nres].end   = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
+    res[nres].flags = IORESOURCE_IO;
 
-	pdev = platform_device_alloc(DRVNAME, sio_address);
-	if (!pdev)
-		return -ENOMEM;
+    err = acpi_check_resource_conflict(&res[nres]);
+    if (err)
+    {
+        if (dmi_data && dmi_data->skip_acpi_res)
+            pr_info("Ignoring expected ACPI resource conflict\n");
+        else if (!ignore_resource_conflict)
+            return err;
+    }
 
-	err = platform_device_add_resources(pdev, &res, 1);
-	if (err) {
-		pr_err("Device resource addition failed (%d)\n", err);
-		goto exit_device_put;
-	}
+    nres++;
 
-	err = platform_device_add_data(pdev, sio_data,
-				       sizeof(struct it87_sio_data));
-	if (err) {
-		pr_err("Platform data allocation failed\n");
-		goto exit_device_put;
-	}
+    /* Secondary MMIO Resource*/
+    if (mmio_address)
+    {
+        phys_addr_t start = mmio_address;
+        phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
-	err = platform_device_add(pdev);
-	if (err) {
-		pr_err("Device addition failed (%d)\n", err);
-		goto exit_device_put;
-	}
+        /* H2RAM chips have an extra EC/HWM block mapped into the window
+         * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
+        if (sio_data->mmio_h2ram)
+        {
+            start = mmio_address;
+            end   = mmio_address + H2RAM_HI_BOUND;
+        }
 
-	it87_pdev[index] = pdev;
-	return 0;
+        res[nres].name  = DRVNAME;
+        res[nres].start = start;
+        res[nres].end   = end;
+        res[nres].flags = IORESOURCE_MEM;
+        nres++;
+    }
+
+    /* Extended ECIO port pair (I/O, also ACPI-checked)
+     * Reserves base pair between 0x3F0 and 0x3F4 */
+    if (sio_data->ecio_h2ram)
+    {
+        struct resource *io_ecio = &res[nres];
+
+        io_ecio->name  = DRVNAME;
+        io_ecio->start = ECIO_DATA;
+        io_ecio->end   = ECIO_CMD_STAT;
+        io_ecio->flags = IORESOURCE_IO;
+
+        err = acpi_check_resource_conflict(io_ecio);
+        if (err)
+        {
+            if (dmi_data && dmi_data->skip_acpi_res)
+                pr_info("Ignoring expected ACPI resource conflict for ECIO\n");
+            else if (!ignore_resource_conflict)
+                return err;
+        }
+
+        nres++;
+    }
+
+    pdev = platform_device_alloc(DRVNAME, sio_address);
+    if (!pdev)
+        return -ENOMEM;
+
+    err = platform_device_add_resources(pdev, res, nres);
+    if (err)
+    {
+        pr_err("Device resource addition failed (%d)\n", err);
+        goto exit_device_put;
+    }
+
+    err = platform_device_add_data(pdev, sio_data,
+                                   sizeof(struct it87_sio_data));
+    if (err)
+    {
+        pr_err("Platform data allocation failed\n");
+        goto exit_device_put;
+    }
+
+    err = platform_device_add(pdev);
+    if (err)
+    {
+        pr_err("Device addition failed (%d)\n", err);
+        goto exit_device_put;
+    }
+
+    it87_pdev[index] = pdev;
+    return 0;
 
 exit_device_put:
-	platform_device_put(pdev);
-	return err;
+    platform_device_put(pdev);
+    return err;
 }
 
 /* callback function for DMI */
@@ -4640,71 +5736,115 @@ MODULE_DEVICE_TABLE(dmi, it87_dmi_table);
 
 static int __init sm_it87_init(void)
 {
-	int sioaddr[2] = { REG_2E, REG_4E };
-	struct it87_sio_data sio_data;
-	unsigned short isa_address[2];
-	phys_addr_t mmio_address;
-	bool found = false;
-	int i, err;
+    int                 sioaddr[2] = { REG_2E, REG_4E };
+    struct it87_sio_data sio_data;
+    unsigned short      isa_address[2];
+    phys_addr_t         mmio_address;
+    bool                found = false;
+    int                 i, err;
 
-	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
+    pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
 
-	err = platform_driver_register(&it87_driver);
-	if (err)
-		return err;
+    err = platform_driver_register(&it87_driver);
+    if (err)
+        return err;
 
-	dmi_check_system(it87_dmi_table);
+    dmi_check_system(it87_dmi_table);
 
-	for (i = 0; i < ARRAY_SIZE(sioaddr); i++) {
-		memset(&sio_data, 0, sizeof(struct it87_sio_data));
-		isa_address[i] = 0;
-		mmio_address = 0;
-		err = it87_find(sioaddr[i], &isa_address[i], &mmio_address,
-				&sio_data, i);
-		if (err || isa_address[i] == 0)
-			continue;
-		/*
-		 * Don't register second chip if its ISA address matches
-		 * the first chip's ISA address.
-		 */
-		if (i && isa_address[i] == isa_address[0])
-			break;
+    for (i=0; i<ARRAY_SIZE(sioaddr); i++) {
+        memset(&sio_data, 0, sizeof(struct it87_sio_data));
+        isa_address[i] = 0;
+        mmio_address   = 0;
 
-		err = it87_device_add(i, isa_address[i], mmio_address,
-				      &sio_data);
-		if (err)
-			goto exit_dev_unregister;
+        err = it87_find(sioaddr[i], &isa_address[i], &mmio_address,
+                        &sio_data, i);
+        if (err || isa_address[i]==0)
+            continue;
 
-		found = true;
+        /*
+         * Don't register second chip if its ISA address matches
+         * the first chip's ISA address.
+         */
+        if (i && isa_address[i]==isa_address[0])
+            continue;
 
-		/*
-		 * IT8705F may respond on both SIO addresses.
-		 * Stop probing after finding one.
-		 */
-		if (sio_data.type == it87)
-			break;
-	}
+        /*
+         * If this chip has a valid MMIO address and is marked as using
+         * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
+         * the global H2 manager slot for it.
+         */
+        if (mmio_address &&
+           (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
+            phys_addr_t base = mmio_address;
+            u32         size;
+            int         slot;
+            int         ret;
 
-	if (!found) {
-		err = -ENODEV;
-		goto exit_unregister;
-	}
-	return 0;
+            /* H2RAM chips need a 4 KiB window, others 1 KiB */
+            if (sio_data.mmio_h2ram)
+                size = 0x1000;
+            else
+                size = 0x400;
 
-exit_dev_unregister:
-	/* NULL check handled by platform_device_unregister */
-	platform_device_unregister(it87_pdev[0]);
+            if (!it87_h2_global_inited) {
+                ret = it87_h2_global_init();
+                if (ret) {
+                    pr_debug("it87: H2RAM global bridge init failed: %d\n",
+                             ret);
+                } else {
+                    it87_h2_global_inited = true;
+                }
+            }
+            if (it87_h2_global_ready) {
+                /* slot 0 = 0x2E, slot 1 = 0x4E */
+                slot = (sioaddr[i]==REG_4E) ? 1 : 0;
+                ret = it87_h2_global_set_slot(slot, base, size);
+                if (ret) {
+                    pr_debug("it87: H2RAM set_slot(%d,%pa,0x%x) failed: %d\n",
+                             slot, &base, size, ret);
+                }
+            }
+        }
+
+        err = it87_device_add(i, isa_address[i], mmio_address, &sio_data);
+        if (err)
+            goto exit_unregister;
+        found = true;
+    }
+    if (!found) {
+        err = -ENODEV;
+        goto exit_unregister;
+    }
+
+    /*
+     * If we successfully configured any H2/bridge slots, enable the
+     * decode windows now. On AMD this will program slot 0; on Intel
+     * it can enable both at once.
+     */
+    if (it87_h2_global_ready) {
+        enum it87_mmio_state st;
+        int                  berr;
+        st = it87_h2_global_get_state();
+        if (st==IT87_MMIO_ORIGINAL || st==IT87_MMIO_DISABLED) {
+            berr = it87_h2_global_set_state(IT87_MMIO_ENABLED_BOTH);
+            if (berr)
+                pr_debug("it87: H2RAM enable windows failed: %d\n", berr);
+        }
+    }
+
+    return 0;
+
 exit_unregister:
-	platform_driver_unregister(&it87_driver);
-	return err;
+    platform_driver_unregister(&it87_driver);
+    return err;
 }
 
-static void __exit sm_it87_exit(void)
-{
-	/* NULL check handled by platform_device_unregister */
-	platform_device_unregister(it87_pdev[1]);
-	platform_device_unregister(it87_pdev[0]);
-	platform_driver_unregister(&it87_driver);
+static void __exit sm_it87_exit(void) {
+    /* NULL check handled by platform_device_unregister */
+    platform_device_unregister(it87_pdev[1]);
+    platform_device_unregister(it87_pdev[0]);
+    it87_h2_global_release();
+    platform_driver_unregister(&it87_driver);
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>, Frank Crawford");
