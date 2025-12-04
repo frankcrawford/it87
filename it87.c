@@ -27,7 +27,6 @@
  *            IT8689E  Super I/O chip w/LPC interface
  *            IT8696E  Super I/O chip w/LPC interface
  *            IT8698E  Super I/O chip w/LPC interface
- *            IT8668E  Super I/O chip w/LPC interface
  *            IT8705F  Super I/O chip w/LPC interface
  *            IT8712F  Super I/O chip w/LPC interface
  *            IT8716F  Super I/O chip w/LPC interface
@@ -955,6 +954,7 @@ struct it87_sio_data {
 	u8 smbus_bitmap;
 	u8 ec_special_config;
 	/* mmio/ecio configuration flags */
+	bool mmio;
 	bool mmio_h2ram;
 	bool ecio_h2ram;
 	bool mmio_bridge;
@@ -4278,6 +4278,8 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 
 			if (has_bridge_mmio(config)) {
 			    sio_data->mmio_bridge = 1;
+			} else {
+				sio_data->mmio = 1;
 			}
 		}
 	}
@@ -5232,7 +5234,10 @@ static int it87_probe(struct platform_device *pdev)
         data->mmio = NULL;
     }
 
-    data->addr              = res_io->start;
+    if(res_io)
+		data->addr = res_io->start;
+	else
+		data->addr = 0;    /* no conventional EC I/O available */
     data->type              = sio_data->type;
     data->sioaddr           = sio_data->sioaddr;
     data->smbus_bitmap      = sio_data->smbus_bitmap;
@@ -5469,24 +5474,50 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 
     memset(res, 0, sizeof(res));
 
-    /*
-     * 1) Primary EC I/O window (always present, always ACPI-checked)
-     */
-    res[nres].name  = DRVNAME;
-    res[nres].start = sio_address + IT87_EC_OFFSET;
-    res[nres].end   = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
-    res[nres].flags = IORESOURCE_IO;
+	/* Only allocate IO Ports if we don't use MMIO */
+	if (!((sio_data->mmio_bridge || sio_data->mmio) && mmio_address)) {
+		/*
+		* 1) Primary EC I/O window (always present, always ACPI-checked)
+		*/
+		res[nres].name  = DRVNAME;
+		res[nres].start = sio_address + IT87_EC_OFFSET;
+		res[nres].end   = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
+		res[nres].flags = IORESOURCE_IO;
 
-    err = acpi_check_resource_conflict(&res[nres]);
-    if (err)
-    {
-        if (dmi_data && dmi_data->skip_acpi_res)
-            pr_info("Ignoring expected ACPI resource conflict\n");
-        else if (!ignore_resource_conflict)
-            return err;
-    }
+		err = acpi_check_resource_conflict(&res[nres]);
+		if (err)
+		{
+			if (dmi_data && dmi_data->skip_acpi_res)
+				pr_info("Ignoring expected ACPI resource conflict\n");
+			else if (!ignore_resource_conflict)
+				return err;
+		}
 
-    nres++;
+		nres++;
+
+		/* Extended ECIO port pair (I/O, also ACPI-checked)
+		 * Reserves base pair between 0x3F0 and 0x3F4 */
+		if (sio_data->ecio_h2ram)
+		{
+			struct resource *io_ecio = &res[nres];
+
+			io_ecio->name  = DRVNAME;
+			io_ecio->start = ECIO_DATA;
+			io_ecio->end   = ECIO_CMD_STAT;
+			io_ecio->flags = IORESOURCE_IO;
+
+			err = acpi_check_resource_conflict(io_ecio);
+			if (err)
+			{
+				if (dmi_data && dmi_data->skip_acpi_res)
+					pr_info("Ignoring expected ACPI resource conflict for ECIO\n");
+				else if (!ignore_resource_conflict)
+					return err;
+			}
+
+			nres++;
+		}
+	}
 
     /* Secondary MMIO Resource*/
     if (mmio_address)
@@ -5506,29 +5537,6 @@ static int __init it87_device_add(int index, unsigned short sio_address,
         res[nres].start = start;
         res[nres].end   = end;
         res[nres].flags = IORESOURCE_MEM;
-        nres++;
-    }
-
-    /* Extended ECIO port pair (I/O, also ACPI-checked)
-     * Reserves base pair between 0x3F0 and 0x3F4 */
-    if (sio_data->ecio_h2ram)
-    {
-        struct resource *io_ecio = &res[nres];
-
-        io_ecio->name  = DRVNAME;
-        io_ecio->start = ECIO_DATA;
-        io_ecio->end   = ECIO_CMD_STAT;
-        io_ecio->flags = IORESOURCE_IO;
-
-        err = acpi_check_resource_conflict(io_ecio);
-        if (err)
-        {
-            if (dmi_data && dmi_data->skip_acpi_res)
-                pr_info("Ignoring expected ACPI resource conflict for ECIO\n");
-            else if (!ignore_resource_conflict)
-                return err;
-        }
-
         nres++;
     }
 
