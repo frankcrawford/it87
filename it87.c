@@ -124,7 +124,6 @@ static struct platform_device *it87_pdev[2];
 
 /* Timeouts and retries */
 #define ECIO_STEP_TIMEOUT   (HZ)  /* ~1 second per wait */
-#define ECIO_RETRIES        0     /* 0 = single attempt; bump if you want retries */
 
 /* Global ECIO lock: serialize all EC-IO access */
 static DEFINE_MUTEX(it87_ecio_lock);
@@ -1530,6 +1529,28 @@ static void it87_h2_global_release(void)
 /* ==== END: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
 /* ECIO H2RAM Access manager */
+
+/* ------------------------------------------------------------
+ * ECIO low-level I/O helpers with debug logging
+ * ------------------------------------------------------------ */
+
+static inline u8 it87_ecio_inb(u16 port)
+{
+    u8 value = inb(port);
+
+    pr_debug("ECIO inb  [0x%04x] -> 0x%02x\n",
+             port, value);
+
+    return value;
+}
+
+static inline void it87_ecio_outb(u8 value, u16 port)
+{
+    pr_debug("ECIO outb [0x%04x] <- 0x%02x\n",
+             port, value);
+
+    outb(value, port);
+}
 /* ------------------------------------------------------------
  * Low-level wait helpers (bus busy handling)
  * ------------------------------------------------------------ */
@@ -1542,8 +1563,8 @@ static int it87_ecio_wait_ibe(void)
 {
     unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
 
-    while (time_before(jiffies, deadline)) {
-        u8 status = inb(ECIO_CMD_STAT);
+    while(time_before(jiffies, deadline)) {
+        u8 status = it87_ecio_inb(ECIO_CMD_STAT);
 
         /* IBF clear => we can write next byte */
         if (!(status & ECIO_CMD_IBF))
@@ -1564,8 +1585,8 @@ static int it87_ecio_wait_obf(void)
 {
     unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
 
-    while (time_before(jiffies, deadline)) {
-        u8 status = inb(ECIO_CMD_STAT);
+    while(time_before(jiffies, deadline)) {
+        u8 status = it87_ecio_inb(ECIO_CMD_STAT);
 
         /* OBF set => data available in ECIO_DATA */
         if (status & ECIO_CMD_OBF)
@@ -1579,7 +1600,7 @@ static int it87_ecio_wait_obf(void)
 }
 
 /* ------------------------------------------------------------
- * Single-attempt EC-IO transactions (no mutex, no retry)
+ * Single-attempt EC-IO transactions (no mutex here)
  * ------------------------------------------------------------ */
 
 /*
@@ -1587,6 +1608,10 @@ static int it87_ecio_wait_obf(void)
  *   CMD_READ -> off_hi -> off_lo -> (wait OBF) -> read data
  *
  * offset must be >= 0x0100 (high byte non-zero).
+ *
+ *   - WaitIBE before every write
+ *   - WaitIBE after every write
+ *   - WaitOBF before reading data
  */
 static int it87_ecio_read_once(u16 offset, u8 *value)
 {
@@ -1600,34 +1625,48 @@ static int it87_ecio_read_once(u16 offset, u8 *value)
     off_hi = (offset >> 8) & 0xFF;
     off_lo = offset & 0xFF;
 
-    /* Enforce >= 0x0100 like the Python/Windows implementation */
     if (off_hi == 0)
         return -EINVAL;
 
-    /* CMD_READ */
+    /* CMD_READ (0xB0) */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(ECIO_CMD_READ, ECIO_CMD_STAT);
+
+    it87_ecio_outb(ECIO_CMD_READ, ECIO_CMD_STAT);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* off_hi */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(off_hi, ECIO_DATA);
+
+    it87_ecio_outb(off_hi, ECIO_DATA);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* off_lo */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(off_lo, ECIO_DATA);
+
+    it87_ecio_outb(off_lo, ECIO_DATA);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* wait for data to appear */
     err = it87_ecio_wait_obf();
     if (err)
         return err;
 
-    *value = inb(ECIO_DATA);
+    *value = it87_ecio_inb(ECIO_DATA);
     return 0;
 }
 
@@ -1636,6 +1675,9 @@ static int it87_ecio_read_once(u16 offset, u8 *value)
  *   CMD_WRITE -> off_hi -> off_lo -> data
  *
  * offset must be >= 0x0100 (high byte non-zero).
+ *
+ *   - WaitIBE before every write
+ *   - WaitIBE after every write (including the data byte)
  */
 static int it87_ecio_write_once(u16 offset, u8 value)
 {
@@ -1649,35 +1691,55 @@ static int it87_ecio_write_once(u16 offset, u8 value)
     if (off_hi == 0)
         return -EINVAL;
 
-    /* CMD_WRITE */
+    /* CMD_WRITE (0xB1) */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(ECIO_CMD_WRITE, ECIO_CMD_STAT);
+
+    it87_ecio_outb(ECIO_CMD_WRITE, ECIO_CMD_STAT);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* off_hi */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(off_hi, ECIO_DATA);
+
+    it87_ecio_outb(off_hi, ECIO_DATA);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* off_lo */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(off_lo, ECIO_DATA);
+
+    it87_ecio_outb(off_lo, ECIO_DATA);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     /* data */
     err = it87_ecio_wait_ibe();
     if (err)
         return err;
-    outb(value, ECIO_DATA);
+
+    it87_ecio_outb(value, ECIO_DATA);
+
+    err = it87_ecio_wait_ibe();
+    if (err)
+        return err;
 
     return 0;
 }
 
 /* ------------------------------------------------------------
- * Public backend: mutex + (optional) retries + error handling
+ * Main Accessors
  * ------------------------------------------------------------ */
 
 /*
@@ -1685,15 +1747,10 @@ static int it87_ecio_write_once(u16 offset, u8 value)
  *
  *  - reg is the EC offset (0x0100..0xFFFF)
  *  - Returns 0..255 (byte) on success
- *  - On error, logs and returns 0xFF (to avoid breaking callers
- *    that assume non-negative return is always a byte).
  *
- * If you later want “proper” errno propagation, change the tail
- * to `return err;` and adjust call sites accordingly.
  */
 static int _it87_ecio_read(struct it87_data *data, u16 reg)
 {
-    int attempt;
     int err;
     u8 value = 0;
 
@@ -1701,26 +1758,19 @@ static int _it87_ecio_read(struct it87_data *data, u16 reg)
 
     mutex_lock(&it87_ecio_lock);
 
-    for (attempt=0; attempt<=ECIO_RETRIES; attempt++) {
-        err = it87_ecio_read_once(reg, &value);
-        if (!err) {
-            mutex_unlock(&it87_ecio_lock);
-            return value;
-        }
-
-        /* Only retry timeouts; other errors are hard failures */
-        if (err != -ETIMEDOUT)
-            break;
-
-        udelay(10000); /* 10 ms backoff */
-    }
+    err = it87_ecio_read_once(reg, &value);
 
     mutex_unlock(&it87_ecio_lock);
 
-    pr_debug("it87: ECIO read failed at offset 0x%04x (err=%d)\n", reg, err);
+    if (err) {
+        pr_debug("ECIO read failed at offset 0x%04x (err=%d)\n",
+                 reg, err);
+    } else {
+        pr_debug("ECIO read 0x%02x from offset 0x%04x\n",
+                 value, reg);
+    }
 
-    /* Fallback safe value on error */
-    return 0xFF;
+    return value;
 }
 
 /*
@@ -1729,33 +1779,25 @@ static int _it87_ecio_read(struct it87_data *data, u16 reg)
  *  - reg is the EC offset (0x0100..0xFFFF)
  *  - value is the byte to write
  *  - Errors are logged; no errno is returned to caller.
+ *
  */
 static void _it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 {
-    int attempt;
     int err;
 
     (void)data;
 
     mutex_lock(&it87_ecio_lock);
 
-    for (attempt=0; attempt<=ECIO_RETRIES; attempt++) {
-        err = it87_ecio_write_once(reg, value);
-        if (!err) {
-            mutex_unlock(&it87_ecio_lock);
-            return;
-        }
-
-        if (err != -ETIMEDOUT)
-            break;
-
-        udelay(10000);
-    }
+    err = it87_ecio_write_once(reg, value);
 
     mutex_unlock(&it87_ecio_lock);
 
-    pr_debug("it87: ECIO write failed at offset 0x%04x (value=0x%02x, err=%d)\n",
-             reg, value, err);
+    if (err) {
+        pr_debug("ECIO write failed at offset 0x%04x "
+                 "(value=0x%02x, err=%d)\n",
+                 reg, value, err);
+    }
 }
 /* End of ECIO H2RAM access manager */
 
@@ -2071,11 +2113,7 @@ static void it87_h2ram_write(struct it87_data *data, u16 reg, u8 value)
 static int it87_ecio_read(struct it87_data *data, u16 reg)
 {
     /* High region: go through ECIO window if hybrid ECIO is active */
-    if (reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND &&
-       likely(data->mmio) &&
-       !(data->features & FEAT_MMIO) &&
-       data->ecio_h2ram)
-    {
+    if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
         return _it87_ecio_read(data, reg);
     }
 
@@ -2086,11 +2124,7 @@ static int it87_ecio_read(struct it87_data *data, u16 reg)
 static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 {
     /* High region: go through ECIO window if hybrid ECIO is active */
-    if (reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND &&
-       likely(data->mmio) &&
-       !(data->features & FEAT_MMIO) &&
-       data->ecio_h2ram)
-    {
+    if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
         _it87_ecio_write(data, reg, value);
         return;
     }
@@ -4315,6 +4349,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
         }
         /* If SMFI is disabled check if has ECIO and on AMD, if so, then enable ECIO */
         else if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && has_h2ram_ecio(config)) {
+            pr_info("AMD platform with ECIO H2RAM detected, enabling ECIO backend\n");
             sio_data->ecio_h2ram = 1;
         }
 
@@ -4919,13 +4954,13 @@ static void it87_init_regs(struct platform_device *pdev)
         } else if (data->mmio_h2ram) {
             data->read  = it87_h2ram_read;
             data->write = it87_h2ram_write;
-        } else if (data->ecio_h2ram) {
-            data->read  = it87_ecio_read;
-            data->write = it87_ecio_write;
         } else {
 		    data->read  = it87_mmio_read;
 		    data->write = it87_mmio_write;
         }
+    } else if (data->ecio_h2ram) {
+        data->read  = it87_ecio_read;
+        data->write = it87_ecio_write;
 	} else if (has_bank_sel(data)) {
 		data->read = it87_io_read;
 		data->write = it87_io_write;
@@ -5797,7 +5832,7 @@ static int __init sm_it87_init(void)
             if (!it87_h2_global_inited) {
                 ret = it87_h2_global_init();
                 if (ret) {
-                    pr_debug("it87: H2RAM global bridge init failed: %d\n",
+                    pr_debug("H2RAM global bridge init failed: %d\n",
                              ret);
                 } else {
                     it87_h2_global_inited = true;
@@ -5808,7 +5843,7 @@ static int __init sm_it87_init(void)
                 slot = (sioaddr[i]==REG_4E) ? 1 : 0;
                 ret = it87_h2_global_set_slot(slot, base, size);
                 if (ret) {
-                    pr_debug("it87: H2RAM set_slot(%d,%pa,0x%x) failed: %d\n",
+                    pr_debug("H2RAM set_slot(%d,%pa,0x%x) failed: %d\n",
                              slot, &base, size, ret);
                 }
             }
@@ -5836,7 +5871,7 @@ static int __init sm_it87_init(void)
         if (st==IT87_MMIO_ORIGINAL || st==IT87_MMIO_DISABLED) {
             berr = it87_h2_global_set_state(IT87_MMIO_ENABLED_BOTH);
             if (berr)
-                pr_debug("it87: H2RAM enable windows failed: %d\n", berr);
+                pr_debug("H2RAM enable windows failed: %d\n", berr);
         }
     }
 
