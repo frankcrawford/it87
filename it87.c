@@ -2894,6 +2894,23 @@ static int check_trip_points(struct device *dev, int nr)
 	return err;
 }
 
+/*
+ * SmartFan global control in H2RAM:
+ * Please refer to it87_update_smartfan_global() for details.
+ */
+static void it87_update_smartfan_bit(struct it87_data *data, bool enable)
+{
+	u8 val;
+	int  cur;
+
+	val = enable ? 0x01 : 0x00;
+	cur = data->read(data,IT87_SMARTFAN_ENABLE);
+	if (cur >= 0 && (u8)cur == val)
+		return;
+	/* 0x947 is the SmartFan global control byte in H2RAM */
+	data->write(data, IT87_SMARTFAN_ENABLE, val);
+}
+
 /* SmartFan global control in H2RAM:
  *   0x00 = manual / non-automatic (any channel non-auto)
  *   0x01 = automatic (all channels automatic)
@@ -2905,8 +2922,6 @@ static void it87_update_smartfan_global(struct it87_data *data)
 {
     bool all_auto = true;
     int  i;
-    u8   val;
-    int  cur;
 
     for (i=0; i<NUM_AUTO_PWM; i++) {
         /* Skip PWM channels that are not actually used/enabled */
@@ -2920,12 +2935,7 @@ static void it87_update_smartfan_global(struct it87_data *data)
         }
     }
 
-    val = all_auto ? 0x01 : 0x00;
-    cur = data->read(data,IT87_SMARTFAN_ENABLE);
-    if (cur >= 0 && (u8)cur == val)
-        return;
-    /* 0x947 is the SmartFan global control byte in H2RAM */
-    data->write(data, IT87_SMARTFAN_ENABLE, val);
+	it87_update_smartfan_bit(data, all_auto);
 }
 
 
@@ -5489,11 +5499,37 @@ static int it87_resume(struct device *dev)
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, NULL, it87_resume);
+static int it87_suspend(struct device *dev)
+{
+    struct it87_data *data = dev_get_drvdata(dev);
+
+	if (data->mmio_h2ram || data->ecio_h2ram)
+	{
+		/* Restore smartfan control bit on suspend */
+		it87_update_smartfan_bit(data, true);
+	}
+    return 0;
+}
+
+static int it87_pm_resume(struct device *dev)
+{
+	struct it87_data *data = dev_get_drvdata(dev);
+	if (data->mmio_h2ram || data->ecio_h2ram)
+		it87_update_smartfan_global(data);
+
+	return 0;
+}
+
+/* SmartFan suspend/resume PM ops */
+static const struct dev_pm_ops it87_pm_ops = {
+    .suspend = it87_suspend,
+    .resume  = it87_pm_resume,
+};
 
 static struct platform_driver it87_driver = {
 	.driver = {
 		.name	= DRVNAME,
-		.pm	= pm_sleep_ptr(&it87_dev_pm_ops),
+		.pm	= &it87_pm_ops,
 	},
 	.probe	= it87_probe,
 };
