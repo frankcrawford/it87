@@ -28,11 +28,19 @@ SYSTEM_MAP = /proc/kallsyms
 endif
 
 DRIVER := it87
-ifneq ("","$(wildcard .git/*)")
-DRIVER_VERSION := $(shell git describe --long).$(shell date -u -d "$$(git show -s --format=%ci HEAD)" +%Y%m%d)
-else
-ifneq ("", "$(wildcard VERSION)")
+# If DRIVER_VERSION is provided (e.g. from dkms-install.sh), don't override it.
+ifndef DRIVER_VERSION
+# Prefer a VERSION file if it exists (e.g. in /usr/src/it87-<version>)
+ifneq ("","$(wildcard VERSION)")
 DRIVER_VERSION := $(shell cat VERSION)
+# Else, if this looks like a git repo, derive version from git metadata
+else ifneq ("","$(wildcard .git/*)")
+DRIVER_VERSION := $(shell \
+		    GIT_DESC=$$(git describe --long --always 2>/dev/null || echo unknown); \
+		    GIT_DATE=$$(git show -s --format=%ci HEAD 2>/dev/null || date -u +'%Y-%m-%d 00:00:00'); \
+		    DATE_PART=$$(date -u -d "$$GIT_DATE" +%Y%m%d 2>/dev/null || date -u +%Y%m%d); \
+		    echo "$$GIT_DESC.$$DATE_PART" )
+# Final fallback if there's no VERSION file and no usable git info
 else
 DRIVER_VERSION := unknown
 endif
