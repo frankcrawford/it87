@@ -1439,13 +1439,9 @@ static void it87_h2_release(struct it87_h2ram_handle *h)
 static int it87_h2_global_init(void)
 {
     int ret;
-
-    mutex_lock(&mmio_lock);
     ret = it87_h2_init(&it87_h2_global);
     if (!ret)
         it87_h2_global_ready = true;
-    mutex_unlock(&mmio_lock);
-
     return ret;
 }
 
@@ -1453,15 +1449,10 @@ static int it87_h2_global_init(void)
 static int it87_h2_global_set_slot(int idx, u64 mmio_base, u32 size)
 {
     int ret;
-
-    mutex_lock(&mmio_lock);
     if (!it87_h2_global_ready) {
-        mutex_unlock(&mmio_lock);
         return -ENODEV;
     }
     ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base, size);
-    mutex_unlock(&mmio_lock);
-
     return ret;
 }
 
@@ -1500,15 +1491,10 @@ static enum it87_mmio_state it87_h2_global_get_state(void)
 static int it87_h2_global_use_slot(int idx)
 {
     int ret;
-
-    mutex_lock(&mmio_lock);
     if (!it87_h2_global_ready) {
-        mutex_unlock(&mmio_lock);
         return -ENODEV;
     }
     ret = it87_h2_use_slot(&it87_h2_global, idx);
-    mutex_unlock(&mmio_lock);
-
     return ret;
 }
 
@@ -2022,7 +2008,7 @@ static void it87_io_write(struct it87_data *data, u16 reg, u8 value)
 
 /* ----- MMIO / hybrid backends ----- */
 
-/* Pure MMIO helper – no bridge logic here */
+/* Raw MMIO Accessors */
 static int it87_mmio_read(struct it87_data *data, u16 reg)
 {
     return readb(data->mmio + reg);
@@ -2033,35 +2019,47 @@ static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
     writeb(value, data->mmio + reg);
 }
 
-/* Pure MMIO via ISA bridge window (no hybrid I/O) */
+/* ISA bridge MMIO accessors */
 static int it87_bridge_read(struct it87_data *data, u16 reg)
 {
-    if (likely(data->mmio) &&
-       !(data->features & FEAT_MMIO) &&
-       it87_h2_global_ready &&
-       data->mmio_bridge) {
+    if (data->mmio &&
+    	!(data->features & FEAT_MMIO) &&
+    	it87_h2_global_ready &&
+    	(data->mmio_bridge || data->mmio_h2ram)) {
         int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+        int ret;
 
-        if (unlikely(it87_h2_global_use_slot(slot)))
-            return -EIO;
+        mutex_lock(&mmio_lock);
+
+        if (it87_h2_global_use_slot(slot)) {
+        	mutex_unlock(&mmio_lock);
+        	return -EIO;
+		}
+
+		ret = it87_mmio_read(data, reg);
+        mutex_unlock(&mmio_lock);
+        return ret;
     }
-
-    return it87_mmio_read(data, reg);
+	return 0;
 }
 
 static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 {
-    if (likely(data->mmio) &&
-       !(data->features & FEAT_MMIO) &&
-       it87_h2_global_ready &&
-       data->mmio_bridge) {
+    if (data->mmio &&
+    	!(data->features & FEAT_MMIO) &&
+    	it87_h2_global_ready &&
+    	(data->mmio_bridge || data->mmio_h2ram)) {
         int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 
-        if (unlikely(it87_h2_global_use_slot(slot)))
-            return; /* best effort */
-    }
+		mutex_lock(&mmio_lock);
 
-    it87_mmio_write(data, reg, value);
+        if (it87_h2_global_use_slot(slot)) {
+			mutex_unlock(&mmio_lock);
+			return;
+		}
+		it87_mmio_write(data, reg, value);
+		mutex_unlock(&mmio_lock);
+    }
 }
 
 /* Hybrid H2RAM access:
@@ -2071,15 +2069,6 @@ static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 static int it87_h2ram_read(struct it87_data *data, u16 reg)
 {
     if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-        if (likely(data->mmio) &&
-           !(data->features & FEAT_MMIO) &&
-           it87_h2_global_ready &&
-           data->mmio_h2ram) {
-            int slot = (data->sioaddr==REG_4E) ? 1 : 0;
-
-            if (unlikely(it87_h2_global_use_slot(slot)))
-                return -EIO;
-        }
         /* High region: go through MMIO window */
         return it87_bridge_read(data, reg);
     }
@@ -2090,21 +2079,10 @@ static int it87_h2ram_read(struct it87_data *data, u16 reg)
 static void it87_h2ram_write(struct it87_data *data, u16 reg, u8 value)
 {
     if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-        if (likely(data->mmio) &&
-           !(data->features & FEAT_MMIO) &&
-           it87_h2_global_ready &&
-           data->mmio_h2ram) {
-            int slot = (data->sioaddr==REG_4E) ? 1 : 0;
-
-            if (unlikely(it87_h2_global_use_slot(slot)))
-                return; /* best effort */
-        }
-
         /* High region: go through MMIO window */
         it87_bridge_write(data, reg, value);
         return;
     }
-
     /* Low region: conventional EC I/O path */
     _it87_io_write(data, reg, value);
 }
@@ -2901,6 +2879,19 @@ static int check_trip_points(struct device *dev, int nr)
  * Only call this when data->mmio_h2ram or data->ecio_h2ram is true.
  * For newer H2RAM based controllers with separate SmartFan toggle'
  */
+static void it87_update_smartfan_bit(struct it87_data *data, bool enable)
+{
+	u8 	val;
+	int cur;
+ 
+	val = enable ? 0x01 : 0x00;
+	cur = data->read(data,IT87_SMARTFAN_ENABLE);
+	if (cur >= 0 && (u8)cur == val)
+	return;
+	/* 0x947 is the SmartFan global control byte in H2RAM */
+	data->write(data, IT87_SMARTFAN_ENABLE, val);
+}
+
 static void it87_update_smartfan_global(struct it87_data *data)
 {
     bool all_auto = true;
@@ -2919,13 +2910,7 @@ static void it87_update_smartfan_global(struct it87_data *data)
             break;
         }
     }
-
-    val = all_auto ? 0x01 : 0x00;
-    cur = data->read(data,IT87_SMARTFAN_ENABLE);
-    if (cur >= 0 && (u8)cur == val)
-        return;
-    /* 0x947 is the SmartFan global control byte in H2RAM */
-    data->write(data, IT87_SMARTFAN_ENABLE, val);
+	it87_update_smartfan_bit(data, all_auto);
 }
 
 
@@ -3005,9 +2990,8 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		}
 	}
 
-	 /* If this device uses H2RAM/ECIO SmartFan, sync the global bit at 0x947 first */
-    if (data->mmio_h2ram || data->ecio_h2ram)
-    {
+	 /* If this device uses H2RAM/ECIO SmartFan, sync the global bit at 0x947 */
+    if (data->mmio_h2ram || data->ecio_h2ram) {
         it87_update_smartfan_global(data);
     }
 
@@ -5475,6 +5459,10 @@ static int it87_resume(struct device *dev)
 	it87_check_voltage_monitors_reset(data);
 	it87_check_tachometers_reset(pdev);
 	it87_check_tachometers_16bit_mode(pdev);
+	
+	if (data->mmio_h2ram || data->ecio_h2ram) {
+        it87_update_smartfan_global(data);
+    }
 
 	it87_start_monitoring(data);
 
@@ -5512,7 +5500,7 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 	/* Only allocate IO Ports if we don't use MMIO */
 	if (!((sio_data->mmio_bridge || sio_data->mmio) && mmio_address)) {
 		/*
-		* 1) Primary EC I/O window (always present, always ACPI-checked)
+		* 1) Primary EC I/O window (If enabled, ACPI-checked)
 		*/
 		res[nres].name  = DRVNAME;
 		res[nres].start = sio_address + IT87_EC_OFFSET;
