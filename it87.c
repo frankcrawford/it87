@@ -407,7 +407,7 @@ static const u16 IT87_REG_TEMP_SRC1[] = { 0x21d, 0x21e, 0x21f };
 struct it87_devices {
 	const char *name;
 	const char * const model;
-	u32 features;
+	u64 features;
 	u8 num_temp_limit;
 	u8 num_temp_offset;
 	u8 num_temp_map;	/* Number of temperature sources for pwm */
@@ -966,7 +966,7 @@ struct it87_sio_data {
 struct it87_data {
 	const struct attribute_group *groups[7];
 	enum chips type;
-	u32 features;
+	u64 features;
 	u8 peci_mask;
 	u8 old_peci_mask;
 
