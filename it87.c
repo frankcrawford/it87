@@ -1072,7 +1072,7 @@ struct it87_h2ram_handle
     u32 pages[2];          /* number of 64KiB pages (>=1) */
     bool have[2];
 
-    /* AMD: track currently programmed base to minimize churn */
+    /* AMD/Intel: track currently programmed base to minimize churn */
     u32 current_base;
 };
 
@@ -1091,8 +1091,7 @@ enum it87_mmio_state
     IT87_MMIO_ORIGINAL     = -1,
     IT87_MMIO_DISABLED     = 0,
     IT87_MMIO_ENABLED_2E   = 1,   /* slot 0 (SIO 0x2E) */
-    IT87_MMIO_ENABLED_4E   = 2,   /* slot 1 (SIO 0x4E) */
-    IT87_MMIO_ENABLED_BOTH = 3    /* Intel only */
+	IT87_MMIO_ENABLED_4E   = 2    /* slot 1 (SIO 0x4E) */
 };
 
 /* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
@@ -1173,6 +1172,7 @@ static void _restore_regs(struct it87_h2ram_handle *h)
     } else if (v==IT87_H2_VENDOR_INTEL) {
         pci_reg_write(h->bridge, 0xd8, h->rd8);
         pci_reg_write(h->bridge, 0x98, h->r98);
+		h->current_base = 0;
     }
 }
 
@@ -1231,8 +1231,7 @@ static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx, u32 base, u32 
  *  0x98: (START<<16)|1 with START=(base>>16)
  *  0xD8: clear enable bit(s) (active-low):
  *        - slot0: clear bit0
- *        - slot1: clear one bit chosen from address tables (fallback 0x0001)
- *  Both windows can remain enabled simultaneously.
+ *        - slot1: clear one bit chosen from address tables
  */
 static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx, u32 base)
 {
@@ -1240,27 +1239,26 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx, u32 base)
     u32 d;
     int ret;
 
-    /* BIOSDecodeEnable */
     ret = pci_reg_read(h->bridge, 0xD8, &d);
     if (ret)return ret;
 
-    if (idx==0) {
-        d &= ~BIT(0);
-    } else {
-        u16 mask = _intel_bios_mask_for_data_space(base);
+	if (idx==0) {
+		d &= ~BIT(0);
+	} else {
+		u16 mask = _intel_bios_mask_for_data_space(base);
 
-        if (!mask)mask = _intel_bios_mask_for_feat_space(base);
-        if (!mask)mask = 0x0001;
-        d &= ~((u32)mask);
-    }
+		if (!mask)mask = _intel_bios_mask_for_feat_space(base);
+		if (!mask) return -EINVAL; /* do not fall back to bit0 */
+		d &= ~((u32)mask);
+	}
     ret = pci_reg_write(h->bridge, 0xD8, d);
     if (ret)return ret;
 
-    /* LPCGenericMemoryRange */
     d = (start << 16) | 1u;
     ret = pci_reg_write(h->bridge, 0x98, d);
     if (ret)return ret;
-
+	
+	h->current_base = base;
     return 0;
 }
 
@@ -1331,96 +1329,17 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base,
     return 0;
 }
 
-static int it87_h2_set_state(struct it87_h2ram_handle *h, enum it87_mmio_state st)
-{
-    int ret;
-
-    if (!h || !h->bridge)return -ENODEV;
-
-    if (st==IT87_MMIO_ORIGINAL || st==IT87_MMIO_DISABLED) {
-        _restore_regs(h);
-        return 0;
-    }
-
-    if (st==IT87_MMIO_ENABLED_2E) {
-        if (!h->have[0])return -EINVAL;
-        if (h->is_amd) {
-            if (h->current_base != h->base[0]) {
-                ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
-                if (ret)return ret;
-            }
-            return 0;
-        }
-        return _enable_slot(h, 0, h->base[0], h->pages[0]);
-    }
-
-    if (st==IT87_MMIO_ENABLED_4E) {
-        if (!h->have[1])return -EINVAL;
-        if (h->is_amd) {
-            if (h->current_base != h->base[1]) {
-                ret = _enable_slot(h, 1, h->base[1], h->pages[1]);
-                if (ret)return ret;
-            }
-            return 0;
-        }
-        return _enable_slot(h, 1, h->base[1], h->pages[1]);
-    }
-
-    if (st==IT87_MMIO_ENABLED_BOTH) {
-        if (!h->have[0] || !h->have[1])return -EINVAL;
-
-        if (h->is_amd) {
-            /* AMD cannot hold two simultaneously – pick slot 0 */
-            if (h->current_base != h->base[0]) {
-                ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
-                if (ret)return ret;
-            }
-            return 0;
-        }
-
-        /* Intel: enable both, order is not critical */
-        ret = _enable_slot(h, 0, h->base[0], h->pages[0]);
-        if (ret)return ret;
-        ret = _enable_slot(h, 1, h->base[1], h->pages[1]);
-        if (ret)return ret;
-        return 0;
-    }
-
-    return -EINVAL;
-}
-
-static enum it87_mmio_state it87_h2_get_state(struct it87_h2ram_handle *h)
-{
-    if (!h || !h->bridge)return IT87_MMIO_ORIGINAL;
-
-    if (h->is_amd) {
-        if (h->current_base==0)return IT87_MMIO_ORIGINAL;
-        if (h->have[0] && h->current_base==h->base[0])return IT87_MMIO_ENABLED_2E;
-        if (h->have[1] && h->current_base==h->base[1])return IT87_MMIO_ENABLED_4E;
-        return IT87_MMIO_ORIGINAL;
-    }
-
-    if (h->have[0] && h->have[1])return IT87_MMIO_ENABLED_BOTH;
-    if (h->have[0])return IT87_MMIO_ENABLED_2E;
-    if (h->have[1])return IT87_MMIO_ENABLED_4E;
-    return IT87_MMIO_ORIGINAL;
-}
-
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 {
-    if (!h || !h->bridge)return -ENODEV;
-    if (idx<0 || idx>1)return -EINVAL;
-    if (!h->have[idx])return -ENOENT;
+	if (!h || !h->bridge)return -ENODEV;
+	if (idx<0 || idx>1)return -EINVAL;
+	if (!h->have[idx])return -ENOENT;
 
-    if (h->is_amd) {
-        if (h->current_base != h->base[idx]) {
-            return _enable_slot(h, idx, h->base[idx], h->pages[idx]);
-        }
-        return 0;
-    }
-
-    /* Intel: already enabled by set_state or previous enables */
-    return 0;
+	/* Program window on demand for all vendors */
+	if (h->current_base != h->base[idx]) {
+		return _enable_slot(h, idx, h->base[idx], h->pages[idx]);
+	}
+	return 0;
 }
 
 static void it87_h2_release(struct it87_h2ram_handle *h)
@@ -1454,37 +1373,6 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base, u32 size)
     }
     ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base, size);
     return ret;
-}
-
-/* Program bridge to a given state (this does PCI writes) */
-static int it87_h2_global_set_state(enum it87_mmio_state st)
-{
-    int ret;
-
-    mutex_lock(&mmio_lock);
-    if (!it87_h2_global_ready) {
-        mutex_unlock(&mmio_lock);
-        return -ENODEV;
-    }
-    ret = it87_h2_set_state(&it87_h2_global, st);
-    mutex_unlock(&mmio_lock);
-
-    return ret;
-}
-
-/* Query logical state (locked for consistency) */
-static enum it87_mmio_state it87_h2_global_get_state(void)
-{
-    enum it87_mmio_state st;
-
-    mutex_lock(&mmio_lock);
-    if (!it87_h2_global_ready)
-        st = IT87_MMIO_ORIGINAL;
-    else
-        st = it87_h2_get_state(&it87_h2_global);
-    mutex_unlock(&mmio_lock);
-
-    return st;
 }
 
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
@@ -2896,8 +2784,6 @@ static void it87_update_smartfan_global(struct it87_data *data)
 {
     bool all_auto = true;
     int  i;
-    u8   val;
-    int  cur;
 
     for (i=0; i<NUM_AUTO_PWM; i++) {
         /* Skip PWM channels that are not actually used/enabled */
@@ -5845,22 +5731,6 @@ static int __init sm_it87_init(void)
     if (!found) {
         err = -ENODEV;
         goto exit_unregister;
-    }
-
-    /*
-     * If we successfully configured any H2/bridge slots, enable the
-     * decode windows now. On AMD this will program slot 0; on Intel
-     * it can enable both at once.
-     */
-    if (it87_h2_global_ready) {
-        enum it87_mmio_state st;
-        int                  berr;
-        st = it87_h2_global_get_state();
-        if (st==IT87_MMIO_ORIGINAL || st==IT87_MMIO_DISABLED) {
-            berr = it87_h2_global_set_state(IT87_MMIO_ENABLED_BOTH);
-            if (berr)
-                pr_debug("H2RAM enable windows failed: %d\n", berr);
-        }
     }
 
     return 0;
