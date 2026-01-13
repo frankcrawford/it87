@@ -82,6 +82,23 @@
 #include <linux/wmi.h>
 #include "compat.h"
 
+/* Defines fallbacks for processor models */
+#ifndef INTEL_SKYLAKE_L_MODEL
+#define INTEL_SKYLAKE_L_MODEL  0x4E
+#endif
+#ifndef INTEL_SKYLAKE_MODEL
+#define INTEL_SKYLAKE_MODEL    0x5E
+#endif
+#ifndef INTEL_SKYLAKE_X_MODEL
+#define INTEL_SKYLAKE_X_MODEL  0x55
+#endif
+#ifndef INTEL_KABYLAKE_L_MODEL
+#define INTEL_KABYLAKE_L_MODEL 0x8E
+#endif
+#ifndef INTEL_KABYLAKE_MODEL
+#define INTEL_KABYLAKE_MODEL   0x9E
+#endif
+
 #ifndef IT87_DRIVER_VERSION
 #define IT87_DRIVER_VERSION  "<not provided>"
 #endif
@@ -149,14 +166,6 @@ static struct platform_device *it87_pdev[2];
 static DEFINE_MUTEX(it87_ecio_lock);
 /* Global MMIO mutex lock (serializes access to the bridge) */
 static DEFINE_MUTEX(mmio_lock);
-
-/* Global MMIO bridge state tracking */
-static struct it87_h2ram_handle it87_h2_global;
-static bool                    it87_h2_global_ready;
-/* Only call it87_h2_global_init() once from sm_it87_init() */
-static bool                    it87_h2_global_inited;
-
-
 
 /* Defines vendor ID's for PCI to ISA bridges */
 #define IT87_H2_VENDOR_AMD     0x1022
@@ -1295,6 +1304,12 @@ struct it87_h2ram_handle
     u32 current_base;
 };
 
+/* Global MMIO bridge state tracking */
+static struct it87_h2ram_handle it87_h2_global;
+static bool                    it87_h2_global_ready;
+/* Only call it87_h2_global_init() once from sm_it87_init() */
+static bool                    it87_h2_global_inited;
+
 /*
  * Intel ISA bridge types:
  * - Z390 bridge when Gigabyte platform id (SIV) == 4 or 6
@@ -1339,11 +1354,11 @@ static bool cpu_is_skl_kbl_cfl_family(void)
 	}
 
 	switch (c->x86_model) {
-	case INTEL_FAM6_SKYLAKE_L:
-	case INTEL_FAM6_SKYLAKE:
-	case INTEL_FAM6_SKYLAKE_X:    /* 0x55 bucket */
-	case INTEL_FAM6_KABYLAKE_L:   /* includes Coffee Lake client buckets */
-	case INTEL_FAM6_KABYLAKE:     /* includes Coffee Lake client buckets */
+    case INTEL_SKYLAKE_L_MODEL:
+	case INTEL_SKYLAKE_MODEL:
+	case INTEL_SKYLAKE_X_MODEL:    /* 0x55 bucket */
+	case INTEL_KABYLAKE_L_MODEL:   /* includes Coffee Lake client buckets */
+	case INTEL_KABYLAKE_MODEL:     /* includes Coffee Lake client buckets */
 		return true;
 
 	default:
@@ -1354,7 +1369,7 @@ static bool cpu_is_skl_kbl_cfl_family(void)
 /* Detect platform and compute/capture hidden base and
  * originals, unlocking E1=0x10 as needed. Caches kind, base, and originals
  * into 'h'. For generic Intel (no hidden window), marks hidden_ready=false. */
-int it87_intel_init_hidden(struct it87_h2ram_handle *h)
+static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 {
 	struct pci_dev *pch_f0 = NULL, *pch_f1 = NULL;
 	u32 bar0 = 0;
