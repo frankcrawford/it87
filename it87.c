@@ -309,8 +309,8 @@ static unsigned int force_id_cnt;
 /* ACPI resource conflicts are ignored if this parameter is set to 1 */
 static bool ignore_resource_conflict;
 
-/* If set the driver uses MMIO to access the chip if supported */
-static bool mmio;
+/* Sets MMIO to true by default. Can be overridden by mmio=off */
+static bool mmio = true;
 
 /* Update battery voltage after every reading if true */
 static bool update_vbat;
@@ -6121,7 +6121,7 @@ module_param(ignore_resource_conflict, bool, 0);
 MODULE_PARM_DESC(ignore_resource_conflict, "Ignore ACPI resource conflict");
 
 module_param(mmio, bool, 0);
-MODULE_PARM_DESC(mmio, "Use MMIO if available");
+MODULE_PARM_DESC(mmio, "Controls MMIO feature, on by default, use mmio=off to disable");
 
 module_param(update_vbat, bool, 0);
 MODULE_PARM_DESC(update_vbat, "Update vbat if set else return powerup value");
