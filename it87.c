@@ -154,8 +154,6 @@ static struct platform_device *it87_pdev[2];
 /* Timeouts and retries */
 #define ECIO_STEP_TIMEOUT   (HZ)  /* ~1 second per wait */
 
-
-
 /* Hidden window offsets by Intel PCH generation */
 #define IT87_HIDDEN_OFS_SKYLAKE         0x00EF2700u
 #define IT87_HIDDEN_OFS_Z390            0x00882700u
@@ -234,13 +232,13 @@ static inline void superio_exit(int ioreg, bool noexit)
 /* PCI Read Routine */
 static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
 {
-    return pci_read_config_dword(d, off, v);
+	return pci_read_config_dword(d, off, v);
 }
 
 /* PCI Write Routine */
 static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 {
-    return pci_write_config_dword(d, off, v);
+	return pci_write_config_dword(d, off, v);
 }
 
 /* Logical device 4 registers */
@@ -311,8 +309,8 @@ static unsigned int force_id_cnt;
 /* ACPI resource conflicts are ignored if this parameter is set to 1 */
 static bool ignore_resource_conflict;
 
-/* If set the driver uses MMIO to access the chip if supported */
-static bool mmio;
+/* Sets MMIO to true by default. Can be overridden by mmio=off */
+static bool mmio = true;
 
 /* Update battery voltage after every reading if true */
 static bool update_vbat;
@@ -1009,9 +1007,9 @@ struct it87_data {
 	u8 sioaddr;		/* SIO port address */
 
 	void __iomem *mmio;	/* MMIO address if available */
-    bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
-    bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
-    bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
+	bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
+	bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
+	bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -1083,183 +1081,183 @@ struct it87_data {
  * We need those for feature detection */
 /* Gigabyte WMI Argument */
 struct gb_wmi_args {
-    u32 arg1; /* page */
+	u32 arg1; /* page */
 };
 
 /* Parsed SIV/MGID description */
 struct gbw_mgid_info {
-    u32 group;        /* raw 32-bit MGID (low 32 bits) */
-    u8  platform;     /* bits 31:28 */
-    u8  special;      /* bits 27:24 */
-    u8  fan_count;    /* bits 20:16 */
-    u8  temp_count;   /* bits 12:8  */
-    u8  volt_count;   /* bits 4:0   */
-    bool supported;   /* platform != 0 and group != 0 */
+	u32 group;        /* raw 32-bit MGID (low 32 bits) */
+	u8  platform;     /* bits 31:28 */
+	u8  special;      /* bits 27:24 */
+	u8  fan_count;    /* bits 20:16 */
+	u8  temp_count;   /* bits 12:8  */
+	u8  volt_count;   /* bits 4:0   */
+	bool supported;   /* platform != 0 and group != 0 */
 };
 
 /* Get raw SIV/LID from WMI */
 static int gbw_hwcfg_u64(u8 page, u64 *res)
 {
-    const struct gb_wmi_args args = { .arg1 = page };
-    const struct acpi_buffer in = { .length = sizeof(args), .pointer = (void *)&args };
-    struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
-    union acpi_object *obj;
-    acpi_status status;
-    int ret = 0;
+	const struct gb_wmi_args args = { .arg1 = page };
+	const struct acpi_buffer in = { .length = sizeof(args), .pointer = (void *)&args };
+	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+	int ret = 0;
 
-    if (!res)
-        return -EINVAL;
+	if (!res)
+		return -EINVAL;
 
-    status = wmi_evaluate_method(GIGABYTE_WMI_GUID, 0,
-                                 GIGABYTE_WMI_GET_HW_CFG_QUERY, &in, &out);
-    if (ACPI_FAILURE(status))
-        return -EIO;
+	status = wmi_evaluate_method(GIGABYTE_WMI_GUID, 0,
+				 GIGABYTE_WMI_GET_HW_CFG_QUERY, &in, &out);
+	if (ACPI_FAILURE(status))
+		return -EIO;
 
-    obj = out.pointer;
-    if (!obj) {
-        ret = -EIO;
-        goto done;
-    }
+	obj = out.pointer;
+	if (!obj) {
+		ret = -EIO;
+		goto done;
+	}
 
-    switch (obj->type) {
-    case ACPI_TYPE_INTEGER:
-        *res = obj->integer.value;
-        break;
-    case ACPI_TYPE_BUFFER:
-        if (!obj->buffer.pointer || obj->buffer.length < 8) {
-            ret = -EIO;
-            break;
-        } else {
-            const u8 *p = obj->buffer.pointer;
-            *res = (u64)p[0]
-                 | ((u64)p[1] << 8)
-                 | ((u64)p[2] << 16)
-                 | ((u64)p[3] << 24)
-                 | ((u64)p[4] << 32)
-                 | ((u64)p[5] << 40)
-                 | ((u64)p[6] << 48)
-                 | ((u64)p[7] << 56);
-        }
-        break;
-    default:
-        ret = -EIO;
-        break;
-    }
+	switch (obj->type) {
+	case ACPI_TYPE_INTEGER:
+		*res = obj->integer.value;
+		break;
+	case ACPI_TYPE_BUFFER:
+		if (!obj->buffer.pointer || obj->buffer.length < 8) {
+			ret = -EIO;
+			break;
+		} else {
+			const u8 *p = obj->buffer.pointer;
+			*res = (u64)p[0]
+		 | ((u64)p[1] << 8)
+		 | ((u64)p[2] << 16)
+		 | ((u64)p[3] << 24)
+		 | ((u64)p[4] << 32)
+		 | ((u64)p[5] << 40)
+		 | ((u64)p[6] << 48)
+		 | ((u64)p[7] << 56);
+		}
+		break;
+	default:
+		ret = -EIO;
+		break;
+	}
 
-    if (!ret && *res == 0)
-        ret = -ENODEV; /* zero means not present */
+	if (!ret && *res == 0)
+		ret = -ENODEV; /* zero means not present */
 
 done:
-    kfree(out.pointer);
-    return ret;
+	kfree(out.pointer);
+	return ret;
 }
 
 /* Get LID */
 static int gbw_lid(u32 *lid)
 {
-    u64 v = 0;
-    int ret = gbw_hwcfg_u64(0x08, &v);
-    if (ret)
-        return ret;
-    *lid = (u32)(v & 0xffffffffu);
-    return 0;
+	u64 v = 0;
+	int ret = gbw_hwcfg_u64(0x08, &v);
+	if (ret)
+		return ret;
+	*lid = (u32)(v & 0xffffffffu);
+	return 0;
 }
 
 /* Get SIV */
 static int gbw_siv(u32 *siv)
 {
-    u64 v = 0;
-    int ret = gbw_hwcfg_u64(0x04, &v);
-    if (ret)
-        return ret;
-    *siv = (u32)(v & 0xffffffffu);
-    return 0;
+	u64 v = 0;
+	int ret = gbw_hwcfg_u64(0x04, &v);
+	if (ret)
+		return ret;
+	*siv = (u32)(v & 0xffffffffu);
+	return 0;
 }
 
 /* Simple DMI check: returns true if the system/vendor strings contain "Gigabyte" */
 static bool mb_is_gigabyte(void)
 {
-    const char *board_vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
-    const char *sys_vendor = dmi_get_system_info(DMI_SYS_VENDOR);
+	const char *board_vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
+	const char *sys_vendor = dmi_get_system_info(DMI_SYS_VENDOR);
 
-    if ((board_vendor && strstr(board_vendor, "Gigabyte")) ||
-        (sys_vendor && strstr(sys_vendor, "Gigabyte")))
-        return true;
-    return false;
+	if ((board_vendor && strstr(board_vendor, "Gigabyte")) ||
+		(sys_vendor && strstr(sys_vendor, "Gigabyte")))
+		return true;
+	return false;
 }
 
 /* Parse low 32-bit MGID/SIV into fields */
 static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
 {
-    if (!out)
-        return -EINVAL;
+	if (!out)
+		return -EINVAL;
 
-    memset(out, 0, sizeof(*out));
-    out->group = mgid;
-    if (mgid == 0)
-        return -ENODEV;
+	memset(out, 0, sizeof(*out));
+	out->group = mgid;
+	if (mgid == 0)
+		return -ENODEV;
 
-    out->platform = (mgid >> 28) & 0xF;
-    if (out->platform == 0)
-        return -ENODEV;
+	out->platform = (mgid >> 28) & 0xF;
+	if (out->platform == 0)
+		return -ENODEV;
 
-    out->special    = (mgid >> 24) & 0xF;
-    out->fan_count  = (mgid >> 16) & 0x1F;
-    out->temp_count = (mgid >>  8) & 0x1F;
-    out->volt_count =  mgid        & 0x1F;
-    out->supported  = true;
-    return 0;
+	out->special    = (mgid >> 24) & 0xF;
+	out->fan_count  = (mgid >> 16) & 0x1F;
+	out->temp_count = (mgid >>  8) & 0x1F;
+	out->volt_count =  mgid        & 0x1F;
+	out->supported  = true;
+	return 0;
 }
 
 /* Read SIV via WMI and parse */
 static int gbw_read_siv_info(struct gbw_mgid_info *out)
 {
-    u32 mgid;
-    int ret = gbw_siv(&mgid);
-    if (ret)
-        return ret;
-    return gbw_parse_mgid(mgid, out);
+	u32 mgid;
+	int ret = gbw_siv(&mgid);
+	if (ret)
+		return ret;
+	return gbw_parse_mgid(mgid, out);
 }
 
 /* Convenience getters for individual SIV/MGID fields */
 static int gbw_siv_platform_id(u8 *platform)
 {
-    struct gbw_mgid_info info;
-    int ret = gbw_read_siv_info(&info);
-    if (ret)
-        return ret;
-    *platform = info.platform;
-    return 0;
+	struct gbw_mgid_info info;
+	int ret = gbw_read_siv_info(&info);
+	if (ret)
+		return ret;
+	*platform = info.platform;
+	return 0;
 }
 
 static int gbw_siv_fan_count(u8 *count)
 {
-    struct gbw_mgid_info info;
-    int ret = gbw_read_siv_info(&info);
-    if (ret)
-        return ret;
-    *count = info.fan_count;
-    return 0;
+	struct gbw_mgid_info info;
+	int ret = gbw_read_siv_info(&info);
+	if (ret)
+		return ret;
+	*count = info.fan_count;
+	return 0;
 }
 
 static int gbw_siv_temp_count(u8 *count)
 {
-    struct gbw_mgid_info info;
-    int ret = gbw_read_siv_info(&info);
-    if (ret)
-        return ret;
-    *count = info.temp_count;
-    return 0;
+	struct gbw_mgid_info info;
+	int ret = gbw_read_siv_info(&info);
+	if (ret)
+		return ret;
+	*count = info.temp_count;
+	return 0;
 }
 
 static int gbw_siv_volt_count(u8 *count)
 {
-    struct gbw_mgid_info info;
-    int ret = gbw_read_siv_info(&info);
-    if (ret)
-        return ret;
-    *count = info.volt_count;
-    return 0;
+	struct gbw_mgid_info info;
+	int ret = gbw_read_siv_info(&info);
+	if (ret)
+		return ret;
+	*count = info.volt_count;
+	return 0;
 }
 /* End of Gigabyte SIV/LID retrieval routines */
 
@@ -1275,19 +1273,19 @@ static struct it87_dmi_data *dmi_data;
 /* MMIO PCI to ISA Bridge management struct */
 struct it87_h2ram_handle
 {
-    struct pci_dev *bridge;
-    bool            is_amd;
-    bool            is_intel;
+	struct pci_dev *bridge;
+	bool            is_amd;
+	bool            is_intel;
 	u8  		    intel_isabridge_type; /* General/z390/skylake */
-    /* Saved dwords we modify (captured once, restored in quiesce/release) */
-    u32 or48, or60, or6c;     	/* AMD: 0x48 MMIO port enable, 0x60 range, 0x6C ROM range 2 */
-    u32 ord8, or98;          	/* Intel: 0xD8 Bridge enable address, 0x98 MMIO Base address */
+	/* Saved dwords we modify (captured once, restored in quiesce/release) */
+	u32 or48, or60, or6c;     	/* AMD: 0x48 MMIO port enable, 0x60 range, 0x6C ROM range 2 */
+	u32 ord8, or98;          	/* Intel: 0xD8 Bridge enable address, 0x98 MMIO Base address */
 	u32 hidden_orig_0x44; 	/* Original mirror D8 at hidden_base+0x44 */
 	u32 hidden_orig_0x40; 	/* Original mirror 98 at hidden_base+0x40 */
-    bool saved;				/* whether original registers have been save */
+	bool saved;				/* whether original registers have been save */
 
-    /* Per-slot requested windows (idx 0=2E, 1=4E), 64KiB aligned */
-    u32 base[2];
+	/* Per-slot requested windows (idx 0=2E, 1=4E), 64KiB aligned */
+	u32 base[2];
 	/* AMD per slot precalculated registers */
 	u32 r48[2];
 	u32 r60[2];
@@ -1295,13 +1293,12 @@ struct it87_h2ram_handle
 	/* Intel per slot precalculated registers */
 	u32 rd8[2];
 	u32 r98[2];
-    bool have[2];
-	
+	bool have[2];
 
 	u32 hidden_base;   		/* hidden base address for z390/skylake bridges */
 	bool hidden_ready;       /* hidden window ready/available */
-    /* AMD/Intel: track currently programmed base to minimize churn */
-    u32 current_base;
+	/* AMD/Intel: track currently programmed base to minimize churn */
+	u32 current_base;
 };
 
 /* Global MMIO bridge state tracking */
@@ -1354,7 +1351,7 @@ static bool cpu_is_skl_kbl_cfl_family(void)
 	}
 
 	switch (c->x86_model) {
-    case INTEL_SKYLAKE_L_MODEL:
+	case INTEL_SKYLAKE_L_MODEL:
 	case INTEL_SKYLAKE_MODEL:
 	case INTEL_SKYLAKE_X_MODEL:    /* 0x55 bucket */
 	case INTEL_KABYLAKE_L_MODEL:   /* includes Coffee Lake client buckets */
@@ -1449,97 +1446,97 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 
 static u16 _intel_bios_mask_for_data_space(u32 base)
 {
-    if ((base & ~0xFFFFF) == 0xFF400000) return 0x0001;
-    if ((base & ~0xFFFFF) == 0xFF500000) return 0x0002;
-    if ((base & ~0xFFFFF) == 0xFF600000) return 0x0004;
-    if ((base & ~0xFFFFF) == 0xFF700000) return 0x0008;
-    if ((base & ~0xFFFF)  == 0x000E0000) return 0x0040;
-    if ((base & ~0xFFFF)  == 0x000F0000) return 0x0080;
-    if ((base & ~0x7FFFF) == 0xFFC00000) return 0x0100;
-    if ((base & ~0x7FFFF) == 0xFFC80000) return 0x0200;
-    if ((base & ~0x7FFFF) == 0xFFD00000) return 0x0400;
-    if ((base & ~0x7FFFF) == 0xFFD80000) return 0x0800;
-    if ((base & ~0x7FFFF) == 0xFFE00000) return 0x1000;
-    if ((base & ~0x7FFFF) == 0xFFE80000) return 0x2000;
-    if ((base & ~0x7FFFF) == 0xFFF00000) return 0x4000;
-    if ((base & ~0x7FFFF) == 0xFFF80000) return 0x8000;
-    return 0;
+	if ((base & ~0xFFFFF) == 0xFF400000) return 0x0001;
+	if ((base & ~0xFFFFF) == 0xFF500000) return 0x0002;
+	if ((base & ~0xFFFFF) == 0xFF600000) return 0x0004;
+	if ((base & ~0xFFFFF) == 0xFF700000) return 0x0008;
+	if ((base & ~0xFFFF)  == 0x000E0000) return 0x0040;
+	if ((base & ~0xFFFF)  == 0x000F0000) return 0x0080;
+	if ((base & ~0x7FFFF) == 0xFFC00000) return 0x0100;
+	if ((base & ~0x7FFFF) == 0xFFC80000) return 0x0200;
+	if ((base & ~0x7FFFF) == 0xFFD00000) return 0x0400;
+	if ((base & ~0x7FFFF) == 0xFFD80000) return 0x0800;
+	if ((base & ~0x7FFFF) == 0xFFE00000) return 0x1000;
+	if ((base & ~0x7FFFF) == 0xFFE80000) return 0x2000;
+	if ((base & ~0x7FFFF) == 0xFFF00000) return 0x4000;
+	if ((base & ~0x7FFFF) == 0xFFF80000) return 0x8000;
+	return 0;
 }
 
 static u16 _intel_bios_mask_for_feat_space(u32 base)
 {
-    if ((base & ~0xFFFFF) == 0xFF000000) return 0x0001;
-    if ((base & ~0xFFFFF) == 0xFF100000) return 0x0002;
-    if ((base & ~0xFFFFF) == 0xFF200000) return 0x0004;
-    if ((base & ~0xFFFFF) == 0xFF300000) return 0x0008;
-    if ((base & ~0x7FFFF) == 0xFF800000) return 0x0100;
-    if ((base & ~0x7FFFF) == 0xFF880000) return 0x0200;
-    if ((base & ~0x7FFFF) == 0xFF900000) return 0x0400;
-    if ((base & ~0x7FFFF) == 0xFF980000) return 0x0800;
-    if ((base & ~0x7FFFF) == 0xFFA00000) return 0x1000;
-    if ((base & ~0x7FFFF) == 0xFFA80000) return 0x2000;
-    if ((base & ~0x7FFFF) == 0xFFB00000) return 0x4000;
-    if ((base & ~0x7FFFF) == 0xFFB80000) return 0x8000;
-    return 0;
+	if ((base & ~0xFFFFF) == 0xFF000000) return 0x0001;
+	if ((base & ~0xFFFFF) == 0xFF100000) return 0x0002;
+	if ((base & ~0xFFFFF) == 0xFF200000) return 0x0004;
+	if ((base & ~0xFFFFF) == 0xFF300000) return 0x0008;
+	if ((base & ~0x7FFFF) == 0xFF800000) return 0x0100;
+	if ((base & ~0x7FFFF) == 0xFF880000) return 0x0200;
+	if ((base & ~0x7FFFF) == 0xFF900000) return 0x0400;
+	if ((base & ~0x7FFFF) == 0xFF980000) return 0x0800;
+	if ((base & ~0x7FFFF) == 0xFFA00000) return 0x1000;
+	if ((base & ~0x7FFFF) == 0xFFA80000) return 0x2000;
+	if ((base & ~0x7FFFF) == 0xFFB00000) return 0x4000;
+	if ((base & ~0x7FFFF) == 0xFFB80000) return 0x8000;
+	return 0;
 }
 
 /* ----- internal save/restore of original bridge state ----- */
 
 static void _save_regs(struct it87_h2ram_handle *h)
 {
-    u16 v;
+	u16 v;
 
-    if (!h || !h->bridge || h->saved) return;
+	if (!h || !h->bridge || h->saved) return;
 
-    v = h->bridge->vendor;
-    if (v == IT87_H2_VENDOR_AMD) {
-        pci_reg_read(h->bridge, 0x48, &h->or48);
-        pci_reg_read(h->bridge, 0x60, &h->or60);
-        pci_reg_read(h->bridge, 0x6C, &h->or6c);
-    } else if (v == IT87_H2_VENDOR_INTEL) {
-        pci_reg_read(h->bridge, 0xD8, &h->ord8);
-        pci_reg_read(h->bridge, 0x98, &h->or98);
-        if (h->hidden_ready && h->hidden_base) {
-            void __iomem *hb = ioremap(h->hidden_base, 0x200);
-            if (hb) {
-                h->hidden_orig_0x40 = readl(hb + 0x40);
-                h->hidden_orig_0x44 = readl(hb + 0x44);
-                iounmap(hb);
-            } else {
-                h->hidden_orig_0x40 = 0;
-                h->hidden_orig_0x44 = 0;
-            }
-        }
-    }
-    h->saved = true;
+	v = h->bridge->vendor;
+	if (v == IT87_H2_VENDOR_AMD) {
+		pci_reg_read(h->bridge, 0x48, &h->or48);
+		pci_reg_read(h->bridge, 0x60, &h->or60);
+		pci_reg_read(h->bridge, 0x6C, &h->or6c);
+	} else if (v == IT87_H2_VENDOR_INTEL) {
+		pci_reg_read(h->bridge, 0xD8, &h->ord8);
+		pci_reg_read(h->bridge, 0x98, &h->or98);
+		if (h->hidden_ready && h->hidden_base) {
+			void __iomem *hb = ioremap(h->hidden_base, 0x200);
+			if (hb) {
+				h->hidden_orig_0x40 = readl(hb + 0x40);
+				h->hidden_orig_0x44 = readl(hb + 0x44);
+				iounmap(hb);
+			} else {
+				h->hidden_orig_0x40 = 0;
+				h->hidden_orig_0x44 = 0;
+			}
+		}
+	}
+	h->saved = true;
 }
 
 static void _restore_regs(struct it87_h2ram_handle *h)
 {
-    u16 v;
+	u16 v;
 
-    if (!h || !h->bridge || !h->saved) return;
+	if (!h || !h->bridge || !h->saved) return;
 
-    v = h->bridge->vendor;
-    if (v == IT87_H2_VENDOR_AMD) {
-        pci_reg_write(h->bridge, 0x48, h->or48);
-        pci_reg_write(h->bridge, 0x60, h->or60);
-        pci_reg_write(h->bridge, 0x6C, h->or6c);
-        h->current_base = 0;
-    } else if (v == IT87_H2_VENDOR_INTEL) {
-        /* Mirror hidden first, then PCI config */
-        if (h->hidden_ready && h->hidden_base) {
-            void __iomem *hb = ioremap(h->hidden_base, 0x200);
-            if (hb) {
-                writel(h->hidden_orig_0x40, hb + 0x40);
-                writel(h->hidden_orig_0x44, hb + 0x44);
-                iounmap(hb);
-            }
-        }
-        pci_reg_write(h->bridge, 0xD8, h->ord8);
-        pci_reg_write(h->bridge, 0x98, h->or98);
-        h->current_base = 0;
-    }
+	v = h->bridge->vendor;
+	if (v == IT87_H2_VENDOR_AMD) {
+		pci_reg_write(h->bridge, 0x48, h->or48);
+		pci_reg_write(h->bridge, 0x60, h->or60);
+		pci_reg_write(h->bridge, 0x6C, h->or6c);
+		h->current_base = 0;
+	} else if (v == IT87_H2_VENDOR_INTEL) {
+		/* Mirror hidden first, then PCI config */
+		if (h->hidden_ready && h->hidden_base) {
+			void __iomem *hb = ioremap(h->hidden_base, 0x200);
+			if (hb) {
+				writel(h->hidden_orig_0x40, hb + 0x40);
+				writel(h->hidden_orig_0x44, hb + 0x44);
+				iounmap(hb);
+			}
+		}
+		pci_reg_write(h->bridge, 0xD8, h->ord8);
+		pci_reg_write(h->bridge, 0x98, h->or98);
+		h->current_base = 0;
+	}
 }
 
 /* ----- discrete per-slot programming ----- */
@@ -1557,20 +1554,20 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
  {
 	 int ret;
- 
+
 	 if (!h || !h->bridge) return -ENODEV;
 	 if (idx < 0 || idx > 1) return -EINVAL;
 	 if (!h->have[idx]) return -EINVAL;
- 
+
 	 ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
 	 if (ret) return ret;
- 
+
 	 ret = pci_reg_write(h->bridge, 0x6C, h->r6c[idx]);
 	 if (ret) return ret;
- 
+
 	 ret = pci_reg_write(h->bridge, 0x48, h->r48[idx]);
 	 if (ret) return ret;
- 
+
 	 h->current_base = h->base[idx];
 	 return 0;
  }
@@ -1583,110 +1580,110 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  */
  static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-    int ret;
+	int ret;
 
-    if (!h || !h->bridge) return -ENODEV;
-    if (idx < 0 || idx > 1) return -EINVAL;
-    if (!h->have[idx]) return -EINVAL;
+	if (!h || !h->bridge) return -ENODEV;
+	if (idx < 0 || idx > 1) return -EINVAL;
+	if (!h->have[idx]) return -EINVAL;
 
-    if (h->current_base == h->base[idx])
-        return 0; /* already active */
+	if (h->current_base == h->base[idx])
+		return 0; /* already active */
 
-    /* Hidden-window mirror first if available */
-    if (h->hidden_ready) { 
-        void __iomem *hb = ioremap(h->hidden_base, 0x200);
-        if (hb) {
-            writel(h->r98[idx], hb + 0x40);
-            writel(h->rd8[idx], hb + 0x44);
-            iounmap(hb);
-        }
-    }
+	/* Hidden-window mirror first if available */
+	if (h->hidden_ready) {
+		void __iomem *hb = ioremap(h->hidden_base, 0x200);
+		if (hb) {
+			writel(h->r98[idx], hb + 0x40);
+			writel(h->rd8[idx], hb + 0x44);
+			iounmap(hb);
+		}
+	}
 
-    /* Then program PCI config */
-    ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
-    if (ret) return ret;
+	/* Then program PCI config */
+	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
+	if (ret) return ret;
 
-    ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
-    if (ret) return ret;
+	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
+	if (ret) return ret;
 
-    h->current_base = h->base[idx];
-    return 0;
+	h->current_base = h->base[idx];
+	return 0;
 }
 
 static int _enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-    u16 v;
+	u16 v;
 
-    if (!h || !h->bridge)return -ENODEV;
-    v = h->bridge->vendor;
-    if (v==IT87_H2_VENDOR_AMD)return 	_amd_enable_slot(h, idx);
-    if (v==IT87_H2_VENDOR_INTEL)return 	_intel_enable_slot(h, idx);
-    return -ENODEV;
+	if (!h || !h->bridge)return -ENODEV;
+	v = h->bridge->vendor;
+	if (v==IT87_H2_VENDOR_AMD)return 	_amd_enable_slot(h, idx);
+	if (v==IT87_H2_VENDOR_INTEL)return 	_intel_enable_slot(h, idx);
+	return -ENODEV;
 }
 
 /* ----- compact internal API (per-bridge handle) ----- */
 
 static int it87_h2_init(struct it87_h2ram_handle *h)
 {
-    struct pci_dev *pdev;
+	struct pci_dev *pdev;
 
-    if (!h)
-        return -EINVAL;
+	if (!h)
+		return -EINVAL;
 
-    memset(h, 0, sizeof(*h));
+	memset(h, 0, sizeof(*h));
 
-    pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
-    while (pdev) {
-        if (pdev->vendor == IT87_H2_VENDOR_AMD || pdev->vendor == IT87_H2_VENDOR_INTEL) {
-            int ret;
+	pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
+	while (pdev) {
+		if (pdev->vendor == IT87_H2_VENDOR_AMD || pdev->vendor == IT87_H2_VENDOR_INTEL) {
+			int ret;
 
-            h->bridge = pdev;
-            pci_dev_get(h->bridge);
-            ret = pci_enable_device(h->bridge);
-            pci_dev_put(pdev);
-            if (ret) {
-                h->bridge = NULL;
-                return ret;
-            }
+			h->bridge = pdev;
+			pci_dev_get(h->bridge);
+			ret = pci_enable_device(h->bridge);
+			pci_dev_put(pdev);
+			if (ret) {
+				h->bridge = NULL;
+				return ret;
+			}
 
-            h->is_amd   = (h->bridge->vendor == IT87_H2_VENDOR_AMD);
-            h->is_intel = (h->bridge->vendor == IT87_H2_VENDOR_INTEL);
+			h->is_amd   = (h->bridge->vendor == IT87_H2_VENDOR_AMD);
+			h->is_intel = (h->bridge->vendor == IT87_H2_VENDOR_INTEL);
 
-            /* For Intel, run the new detection scheme to set kind and, if
-             * applicable (Skylake/Z390), compute and cache the hidden base
-             * using it87_intel_init_hidden().
-             */
-            if (h->is_intel) {
-                int hret = it87_intel_init_hidden(h);
-                if (hret < 0) {
-                    /* Ensure a clean generic state on failure */
-                    h->hidden_ready = false;
-                    h->hidden_base = 0;
-                }
-            }
+			/* For Intel, run the new detection scheme to set kind and, if
+	     * applicable (Skylake/Z390), compute and cache the hidden base
+	     * using it87_intel_init_hidden().
+	     */
+			if (h->is_intel) {
+				int hret = it87_intel_init_hidden(h);
+				if (hret < 0) {
+					/* Ensure a clean generic state on failure */
+					h->hidden_ready = false;
+					h->hidden_base = 0;
+				}
+			}
 			_save_regs(h);
-            return 0;
-        }
-        pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), pdev);
-    }
-    return -ENODEV;
+			return 0;
+		}
+		pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), pdev);
+	}
+	return -ENODEV;
 }
 
 /* Set up MMIO bridge register values */
 static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 {
-    u32 base32;
+	u32 base32;
 
-    if (!h || !h->bridge)return -ENODEV;
-    if (idx<0 || idx>1)return -EINVAL;
-    if (mmio_base==0)return -EINVAL;
-    if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
+	if (!h || !h->bridge)return -ENODEV;
+	if (idx<0 || idx>1)return -EINVAL;
+	if (mmio_base==0)return -EINVAL;
+	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
 
-    base32 = (u32)mmio_base;
-    base32 &= ~0xFFFFu;                        /* 64KiB align down */
+	base32 = (u32)mmio_base;
+	base32 &= ~0xFFFFu;                        /* 64KiB align down */
 
-    h->base[idx]  = base32;
-    h->have[idx]  = true;
+	h->base[idx]  = base32;
+	h->have[idx]  = true;
 
 	/* If bridge is amd calculate the register values for the bridge window of idx */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
@@ -1707,7 +1704,7 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 			h->rd8[idx] = h->ord8 & ~(u32)mask;        /* active-low: clear mask bits */
 		}
 
-    return 0;
+	return 0;
 }
 
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
@@ -1725,10 +1722,10 @@ static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 
 static void it87_h2_release(struct it87_h2ram_handle *h)
 {
-    if (!h || !h->bridge)return;
-    _restore_regs(h);
-    pci_dev_put(h->bridge);
-    h->bridge = NULL;
+	if (!h || !h->bridge)return;
+	_restore_regs(h);
+	pci_dev_put(h->bridge);
+	h->bridge = NULL;
 }
 
 /* ----- Global, locked API for shared MMIO bridge ----- */
@@ -1738,48 +1735,46 @@ static void it87_h2_release(struct it87_h2ram_handle *h)
  */
 static int it87_h2_global_init(void)
 {
-    int ret;
-    ret = it87_h2_init(&it87_h2_global);
-    if (!ret)
-        it87_h2_global_ready = true;
-    return ret;
+	int ret;
+	ret = it87_h2_init(&it87_h2_global);
+	if (!ret)
+		it87_h2_global_ready = true;
+	return ret;
 }
 
 /* Configure a slot (just updates state, does not touch PCI yet) */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
-    int ret;
-    if (!it87_h2_global_ready) {
-        return -ENODEV;
-    }
-    ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
-    return ret;
+	int ret;
+	if (!it87_h2_global_ready) {
+		return -ENODEV;
+	}
+	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+	return ret;
 }
 
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
 static int it87_h2_global_use_slot(int idx)
 {
-    int ret;
-    if (!it87_h2_global_ready) {
-        return -ENODEV;
-    }
-    ret = it87_h2_use_slot(&it87_h2_global, idx);
-    return ret;
+	int ret;
+	if (!it87_h2_global_ready) {
+		return -ENODEV;
+	}
+	ret = it87_h2_use_slot(&it87_h2_global, idx);
+	return ret;
 }
 
 /* Fully release: restore PCI config and drop PCI ref */
 static void it87_h2_global_release(void)
 {
-    mutex_lock(&mmio_lock);
-    if (it87_h2_global_ready) {
-        it87_h2_release(&it87_h2_global);
-        it87_h2_global_ready  = false;
-        it87_h2_global_inited = false;
-    }
-    mutex_unlock(&mmio_lock);
+	mutex_lock(&mmio_lock);
+	if (it87_h2_global_ready) {
+		it87_h2_release(&it87_h2_global);
+		it87_h2_global_ready  = false;
+		it87_h2_global_inited = false;
+	}
+	mutex_unlock(&mmio_lock);
 }
-
-
 
 /* ==== END: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
@@ -1791,20 +1786,20 @@ static void it87_h2_global_release(void)
 
 static inline u8 it87_ecio_inb(u16 port)
 {
-    u8 value = inb(port);
+	u8 value = inb(port);
 
-    pr_debug("ECIO inb  [0x%04x] -> 0x%02x\n",
-             port, value);
+	pr_debug("ECIO inb  [0x%04x] -> 0x%02x\n",
+	     port, value);
 
-    return value;
+	return value;
 }
 
 static inline void it87_ecio_outb(u8 value, u16 port)
 {
-    pr_debug("ECIO outb [0x%04x] <- 0x%02x\n",
-             port, value);
+	pr_debug("ECIO outb [0x%04x] <- 0x%02x\n",
+	     port, value);
 
-    outb(value, port);
+	outb(value, port);
 }
 /* ------------------------------------------------------------
  * Low-level wait helpers (bus busy handling)
@@ -1816,20 +1811,20 @@ static inline void it87_ecio_outb(u8 value, u16 port)
  */
 static int it87_ecio_wait_ibe(void)
 {
-    unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
+	unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
 
-    while(time_before(jiffies, deadline)) {
-        u8 status = it87_ecio_inb(ECIO_CMD_STAT);
+	while(time_before(jiffies, deadline)) {
+		u8 status = it87_ecio_inb(ECIO_CMD_STAT);
 
-        /* IBF clear => we can write next byte */
-        if (!(status & ECIO_CMD_IBF))
-            return 0;
+		/* IBF clear => we can write next byte */
+		if (!(status & ECIO_CMD_IBF))
+			return 0;
 
-        cpu_relax();
-        udelay(10);
-    }
+		cpu_relax();
+		udelay(10);
+	}
 
-    return -ETIMEDOUT;
+	return -ETIMEDOUT;
 }
 
 /*
@@ -1838,20 +1833,20 @@ static int it87_ecio_wait_ibe(void)
  */
 static int it87_ecio_wait_obf(void)
 {
-    unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
+	unsigned long deadline = jiffies + ECIO_STEP_TIMEOUT;
 
-    while(time_before(jiffies, deadline)) {
-        u8 status = it87_ecio_inb(ECIO_CMD_STAT);
+	while(time_before(jiffies, deadline)) {
+		u8 status = it87_ecio_inb(ECIO_CMD_STAT);
 
-        /* OBF set => data available in ECIO_DATA */
-        if (status & ECIO_CMD_OBF)
-            return 0;
+		/* OBF set => data available in ECIO_DATA */
+		if (status & ECIO_CMD_OBF)
+			return 0;
 
-        cpu_relax();
-        udelay(10);
-    }
+		cpu_relax();
+		udelay(10);
+	}
 
-    return -ETIMEDOUT;
+	return -ETIMEDOUT;
 }
 
 /* ------------------------------------------------------------
@@ -1870,59 +1865,59 @@ static int it87_ecio_wait_obf(void)
  */
 static int it87_ecio_read_once(u16 offset, u8 *value)
 {
-    int err;
-    u8 off_hi;
-    u8 off_lo;
+	int err;
+	u8 off_hi;
+	u8 off_lo;
 
-    if (!value)
-        return -EINVAL;
+	if (!value)
+		return -EINVAL;
 
-    off_hi = (offset >> 8) & 0xFF;
-    off_lo = offset & 0xFF;
+	off_hi = (offset >> 8) & 0xFF;
+	off_lo = offset & 0xFF;
 
-    if (off_hi == 0)
-        return -EINVAL;
+	if (off_hi == 0)
+		return -EINVAL;
 
-    /* CMD_READ (0xB0) */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* CMD_READ (0xB0) */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(ECIO_CMD_READ, ECIO_CMD_STAT);
+	it87_ecio_outb(ECIO_CMD_READ, ECIO_CMD_STAT);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* off_hi */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* off_hi */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(off_hi, ECIO_DATA);
+	it87_ecio_outb(off_hi, ECIO_DATA);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* off_lo */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* off_lo */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(off_lo, ECIO_DATA);
+	it87_ecio_outb(off_lo, ECIO_DATA);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* wait for data to appear */
-    err = it87_ecio_wait_obf();
-    if (err)
-        return err;
+	/* wait for data to appear */
+	err = it87_ecio_wait_obf();
+	if (err)
+		return err;
 
-    *value = it87_ecio_inb(ECIO_DATA);
-    return 0;
+	*value = it87_ecio_inb(ECIO_DATA);
+	return 0;
 }
 
 /*
@@ -1936,61 +1931,61 @@ static int it87_ecio_read_once(u16 offset, u8 *value)
  */
 static int it87_ecio_write_once(u16 offset, u8 value)
 {
-    int err;
-    u8 off_hi;
-    u8 off_lo;
+	int err;
+	u8 off_hi;
+	u8 off_lo;
 
-    off_hi = (offset >> 8) & 0xFF;
-    off_lo = offset & 0xFF;
+	off_hi = (offset >> 8) & 0xFF;
+	off_lo = offset & 0xFF;
 
-    if (off_hi == 0)
-        return -EINVAL;
+	if (off_hi == 0)
+		return -EINVAL;
 
-    /* CMD_WRITE (0xB1) */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* CMD_WRITE (0xB1) */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(ECIO_CMD_WRITE, ECIO_CMD_STAT);
+	it87_ecio_outb(ECIO_CMD_WRITE, ECIO_CMD_STAT);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* off_hi */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* off_hi */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(off_hi, ECIO_DATA);
+	it87_ecio_outb(off_hi, ECIO_DATA);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* off_lo */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* off_lo */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(off_lo, ECIO_DATA);
+	it87_ecio_outb(off_lo, ECIO_DATA);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    /* data */
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	/* data */
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    it87_ecio_outb(value, ECIO_DATA);
+	it87_ecio_outb(value, ECIO_DATA);
 
-    err = it87_ecio_wait_ibe();
-    if (err)
-        return err;
+	err = it87_ecio_wait_ibe();
+	if (err)
+		return err;
 
-    return 0;
+	return 0;
 }
 
 /* ------------------------------------------------------------
@@ -2006,26 +2001,26 @@ static int it87_ecio_write_once(u16 offset, u8 value)
  */
 static int _it87_ecio_read(struct it87_data *data, u16 reg)
 {
-    int err;
-    u8 value = 0;
+	int err;
+	u8 value = 0;
 
-    (void)data;
+	(void)data;
 
-    mutex_lock(&it87_ecio_lock);
+	mutex_lock(&it87_ecio_lock);
 
-    err = it87_ecio_read_once(reg, &value);
+	err = it87_ecio_read_once(reg, &value);
 
-    mutex_unlock(&it87_ecio_lock);
+	mutex_unlock(&it87_ecio_lock);
 
-    if (err) {
-        pr_debug("ECIO read failed at offset 0x%04x (err=%d)\n",
-                 reg, err);
-    } else {
-        pr_debug("ECIO read 0x%02x from offset 0x%04x\n",
-                 value, reg);
-    }
+	if (err) {
+		pr_debug("ECIO read failed at offset 0x%04x (err=%d)\n",
+		 reg, err);
+	} else {
+		pr_debug("ECIO read 0x%02x from offset 0x%04x\n",
+		 value, reg);
+	}
 
-    return value;
+	return value;
 }
 
 /*
@@ -2038,21 +2033,21 @@ static int _it87_ecio_read(struct it87_data *data, u16 reg)
  */
 static void _it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 {
-    int err;
+	int err;
 
-    (void)data;
+	(void)data;
 
-    mutex_lock(&it87_ecio_lock);
+	mutex_lock(&it87_ecio_lock);
 
-    err = it87_ecio_write_once(reg, value);
+	err = it87_ecio_write_once(reg, value);
 
-    mutex_unlock(&it87_ecio_lock);
+	mutex_unlock(&it87_ecio_lock);
 
-    if (err) {
-        pr_debug("ECIO write failed at offset 0x%04x "
-                 "(value=0x%02x, err=%d)\n",
-                 reg, value, err);
-    }
+	if (err) {
+		pr_debug("ECIO write failed at offset 0x%04x "
+		 "(value=0x%02x, err=%d)\n",
+		 reg, value, err);
+	}
 }
 /* End of ECIO H2RAM access manager */
 
@@ -2280,52 +2275,52 @@ static void it87_io_write(struct it87_data *data, u16 reg, u8 value)
 /* Raw MMIO Accessors */
 static int it87_mmio_read(struct it87_data *data, u16 reg)
 {
-    return readb(data->mmio + reg);
+	return readb(data->mmio + reg);
 }
 
 static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 {
-    writeb(value, data->mmio + reg);
+	writeb(value, data->mmio + reg);
 }
 
 /* ISA bridge MMIO accessors */
 static int it87_bridge_read(struct it87_data *data, u16 reg)
 {
-    if (data->mmio &&
-        !(data->features & FEAT_MMIO) &&
-        it87_h2_global_ready &&
-        (data->mmio_bridge || data->mmio_h2ram)) {
-        int slot = (data->sioaddr==REG_4E) ? 1 : 0;
-        int val = 0;
+	if (data->mmio &&
+		!(data->features & FEAT_MMIO) &&
+		it87_h2_global_ready &&
+		(data->mmio_bridge || data->mmio_h2ram)) {
+		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+		int val = 0;
 
-        mutex_lock(&mmio_lock);
+		mutex_lock(&mmio_lock);
 
-        if (!it87_h2_global_use_slot(slot)) {
-            val = it87_mmio_read(data, reg);
-        }
-        mutex_unlock(&mmio_lock);
-        return val;
-    }
-    return 0;
+		if (!it87_h2_global_use_slot(slot)) {
+			val = it87_mmio_read(data, reg);
+		}
+		mutex_unlock(&mmio_lock);
+		return val;
+	}
+	return 0;
 }
 
 static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 {
-    if (data->mmio &&
-    	!(data->features & FEAT_MMIO) &&
-    	it87_h2_global_ready &&
-    	(data->mmio_bridge || data->mmio_h2ram)) {
-        int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+	if (data->mmio &&
+		!(data->features & FEAT_MMIO) &&
+		it87_h2_global_ready &&
+		(data->mmio_bridge || data->mmio_h2ram)) {
+		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 
 		mutex_lock(&mmio_lock);
 
-        if (it87_h2_global_use_slot(slot)) {
+		if (it87_h2_global_use_slot(slot)) {
 			mutex_unlock(&mmio_lock);
 			return;
 		}
 		it87_mmio_write(data, reg, value);
 		mutex_unlock(&mmio_lock);
-    }
+	}
 }
 
 /* Hybrid H2RAM access:
@@ -2334,47 +2329,47 @@ static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
  */
 static int it87_h2ram_read(struct it87_data *data, u16 reg)
 {
-    if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-        /* High region: go through MMIO window */
-        return it87_bridge_read(data, reg);
-    }
-    /* Low region: conventional EC I/O path */
-    return _it87_io_read(data, reg);
+	if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
+		/* High region: go through MMIO window */
+		return it87_bridge_read(data, reg);
+	}
+	/* Low region: conventional EC I/O path */
+	return _it87_io_read(data, reg);
 }
 
 static void it87_h2ram_write(struct it87_data *data, u16 reg, u8 value)
 {
-    if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-        /* High region: go through MMIO window */
-        it87_bridge_write(data, reg, value);
-        return;
-    }
-    /* Low region: conventional EC I/O path */
-    _it87_io_write(data, reg, value);
+	if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
+		/* High region: go through MMIO window */
+		it87_bridge_write(data, reg, value);
+		return;
+	}
+	/* Low region: conventional EC I/O path */
+	_it87_io_write(data, reg, value);
 }
 
 /* ECIO + Conventional I/O path */
 static int it87_ecio_read(struct it87_data *data, u16 reg)
 {
-    /* High region: go through ECIO window if hybrid ECIO is active */
-    if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
-        return _it87_ecio_read(data, reg);
-    }
+	/* High region: go through ECIO window if hybrid ECIO is active */
+	if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
+		return _it87_ecio_read(data, reg);
+	}
 
-    /* Low region (or no ECIO hybrid): conventional EC I/O path */
-    return _it87_io_read(data, reg);
+	/* Low region (or no ECIO hybrid): conventional EC I/O path */
+	return _it87_io_read(data, reg);
 }
 
 static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 {
-    /* High region: go through ECIO window if hybrid ECIO is active */
-    if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
-        _it87_ecio_write(data, reg, value);
-        return;
-    }
+	/* High region: go through ECIO window if hybrid ECIO is active */
+	if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
+		_it87_ecio_write(data, reg, value);
+		return;
+	}
 
-    /* Low region (or no ECIO hybrid): conventional EC I/O path */
-    _it87_io_write(data, reg, value);
+	/* Low region (or no ECIO hybrid): conventional EC I/O path */
+	_it87_io_write(data, reg, value);
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -3149,7 +3144,7 @@ static void it87_update_smartfan_bit(struct it87_data *data, bool enable)
 {
 	u8 	val;
 	int cur;
- 
+
 	val = enable ? 0x01 : 0x00;
 	cur = data->read(data,IT87_SMARTFAN_ENABLE);
 	if (cur >= 0 && (u8)cur == val)
@@ -3160,23 +3155,22 @@ static void it87_update_smartfan_bit(struct it87_data *data, bool enable)
 
 static void it87_update_smartfan_global(struct it87_data *data)
 {
-    bool all_auto = true;
-    int  i;
+	bool all_auto = true;
+	int  i;
 
-    for (i=0; i<NUM_AUTO_PWM; i++) {
-        /* Skip PWM channels that are not actually used/enabled */
-        if (!(data->has_pwm & BIT(i)))
-            continue;
+	for (i=0; i<NUM_AUTO_PWM; i++) {
+		/* Skip PWM channels that are not actually used/enabled */
+		if (!(data->has_pwm & BIT(i)))
+			continue;
 
-        /* pwm_mode(): 0 = full, 1 = manual, 2 = automatic */
-        if (pwm_mode(data, i) != 2) {
-            all_auto = false;
-            break;
-        }
-    }
+		/* pwm_mode(): 0 = full, 1 = manual, 2 = automatic */
+		if (pwm_mode(data, i) != 2) {
+			all_auto = false;
+			break;
+		}
+	}
 	it87_update_smartfan_bit(data, all_auto);
 }
-
 
 static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
@@ -3255,9 +3249,9 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 	}
 
 	 /* If this device uses H2RAM/ECIO SmartFan, sync the global bit at 0x947 */
-    if (data->mmio_h2ram || data->ecio_h2ram) {
-        it87_update_smartfan_global(data);
-    }
+	if (data->mmio_h2ram || data->ecio_h2ram) {
+		it87_update_smartfan_global(data);
+	}
 
 	it87_unlock(data);
 	return count;
@@ -4549,7 +4543,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 
 	err = 0;
 	sio_data->revision = superio_inb(sioaddr, DEVREV) & 0x0f;
-    /* Check for standard mmio support. If so, then compose base address*/
+	/* Check for standard mmio support. If so, then compose base address*/
 	if ((has_mmio(config) || has_bridge_mmio(config)) && mmio) {
 		u8 reg;
 
@@ -4565,43 +4559,43 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 			}
 		}
 	}
-    /* Check for H2RAM MMIO */
+	/* Check for H2RAM MMIO */
 	if (has_h2ram_mmio(config) && mmio) {
 		u8 enable;
 		u8 reg;
-        u8 reg1;
-        u8 reg2;
-        /* Select H2RAM (SMFI) configuration space */
-        superio_select(sioaddr, H2RAM);
-        /* Read SMFI enable register */
-        enable = superio_inb(sioaddr, IT87_SMFI_ENABLE);
-        /* If SMFI is enabled Read MMIO base address */
-        if (enable) {
-            reg  = superio_inb(sioaddr, IT87_SMFI_BASE_LOW);
-            reg1 = superio_inb(sioaddr, IT87_SMFI_BASE_HI);
-            /* If IT87952 compose 24 bit address */
-            if (has_h2ram_ex_addr(config)) {
-                reg2  = superio_inb(sioaddr, IT87_SMFI_BASE_EX);
-                base  = 0xFC000000;
-                base |= (u32)reg1 << 16;           /* F6 full       */
-                base |= (u32)(reg & 0xF0) << 12;   /* F5 high nib   */
-                base |= (u32)(reg2 & 0x0F) << 24;
-            }
-            /* If not IT87952 compose 16 bit address */
-            else {
-                base  = 0xFF000000;
-                base |= (u32)reg1 << 16;           /* F6 full       */
-                base |= (u32)(reg & 0xF0) << 12;
-            }
-            sio_data->mmio_h2ram = 1;
-        }
-        /* If SMFI is disabled check if has ECIO and on AMD, if so, then enable ECIO */
-        else if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && has_h2ram_ecio(config)) {
-            pr_info("AMD platform with ECIO H2RAM detected, enabling ECIO backend\n");
-            sio_data->ecio_h2ram = 1;
-        }
+		u8 reg1;
+		u8 reg2;
+		/* Select H2RAM (SMFI) configuration space */
+		superio_select(sioaddr, H2RAM);
+		/* Read SMFI enable register */
+		enable = superio_inb(sioaddr, IT87_SMFI_ENABLE);
+		/* If SMFI is enabled Read MMIO base address */
+		if (enable) {
+			reg  = superio_inb(sioaddr, IT87_SMFI_BASE_LOW);
+			reg1 = superio_inb(sioaddr, IT87_SMFI_BASE_HI);
+			/* If IT87952 compose 24 bit address */
+			if (has_h2ram_ex_addr(config)) {
+				reg2  = superio_inb(sioaddr, IT87_SMFI_BASE_EX);
+				base  = 0xFC000000;
+				base |= (u32)reg1 << 16;           /* F6 full       */
+				base |= (u32)(reg & 0xF0) << 12;   /* F5 high nib   */
+				base |= (u32)(reg2 & 0x0F) << 24;
+			}
+			/* If not IT87952 compose 16 bit address */
+			else {
+				base  = 0xFF000000;
+				base |= (u32)reg1 << 16;           /* F6 full       */
+				base |= (u32)(reg & 0xF0) << 12;
+			}
+			sio_data->mmio_h2ram = 1;
+		}
+		/* If SMFI is disabled check if has ECIO and on AMD, if so, then enable ECIO */
+		else if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && has_h2ram_ecio(config)) {
+			pr_info("AMD platform with ECIO H2RAM detected, enabling ECIO backend\n");
+			sio_data->ecio_h2ram = 1;
+		}
 
-        superio_select(sioaddr, PME);
+		superio_select(sioaddr, PME);
 	}
 
 	*mmio_address = base;
@@ -5196,19 +5190,19 @@ static void it87_init_regs(struct platform_device *pdev)
 	 * it87_ecio_read/write uses ECIO (special ports) and     *
 	 * conventional I/O in the same memory space              */
 	if (data->mmio) {
-        if (data->mmio_bridge) {
-            data->read  = it87_bridge_read;
-            data->write = it87_bridge_write;
-        } else if (data->mmio_h2ram) {
-            data->read  = it87_h2ram_read;
-            data->write = it87_h2ram_write;
-        } else {
+		if (data->mmio_bridge) {
+			data->read  = it87_bridge_read;
+			data->write = it87_bridge_write;
+		} else if (data->mmio_h2ram) {
+			data->read  = it87_h2ram_read;
+			data->write = it87_h2ram_write;
+		} else {
 		    data->read  = it87_mmio_read;
 		    data->write = it87_mmio_write;
-        }
-    } else if (data->ecio_h2ram) {
-        data->read  = it87_ecio_read;
-        data->write = it87_ecio_write;
+		}
+	} else if (data->ecio_h2ram) {
+		data->read  = it87_ecio_read;
+		data->write = it87_ecio_write;
 	} else if (has_bank_sel(data)) {
 		data->read = it87_io_read;
 		data->write = it87_io_write;
@@ -5240,7 +5234,6 @@ static void it87_check_limit_regs(struct it87_data *data)
 			data->write(data, data->REG_TEMP_HIGH[i], 127);
 	}
 }
-
 
 /* Check if voltage monitors are reset manually or by some reason */
 static void it87_check_voltage_monitors_reset(struct it87_data *data)
@@ -5463,29 +5456,29 @@ static int it87_check_pwm(struct device *dev)
 
 static int it87_probe(struct platform_device *pdev)
 {
-    struct it87_data      *data;
-    struct resource       *res_io;
-    struct resource       *res_mmio;
-    struct resource       *res_ecio;
-    struct device         *dev       = &pdev->dev;
-    struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
-    int                    enable_pwm_interface;
-    struct device         *hwmon_dev;
-    int                    err;
+	struct it87_data      *data;
+	struct resource       *res_io;
+	struct resource       *res_mmio;
+	struct resource       *res_ecio;
+	struct device         *dev       = &pdev->dev;
+	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
+	int                    enable_pwm_interface;
+	struct device         *hwmon_dev;
+	int                    err;
 
-    data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
-    if (!data)
-        return -ENOMEM;
+	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
 
-    /*
+	/*
      * Resource layout from it87_device_add():
      *   IORESOURCE_IO  index 0: EC HWM window
      *   IORESOURCE_IO  index 1: ECIO range
      *   IORESOURCE_MEM index 0: MMIO/H2RAM window
      */
 
-    /* Primary EC I/O window (always present) */
-    res_io = platform_get_resource(pdev, IORESOURCE_IO, 0);
+	/* Primary EC I/O window (always present) */
+	res_io = platform_get_resource(pdev, IORESOURCE_IO, 0);
 	if (res_io) {
 		if (!devm_request_region(dev, res_io->start, IT87_EC_EXTENT,
 					 DRVNAME)) {
@@ -5494,8 +5487,8 @@ static int it87_probe(struct platform_device *pdev)
 		}
 	}
 
-    /* Extended EC I/O window */
-    res_ecio = platform_get_resource(pdev, IORESOURCE_IO, 1);
+	/* Extended EC I/O window */
+	res_ecio = platform_get_resource(pdev, IORESOURCE_IO, 1);
 	if (res_ecio) {
 		if (!devm_request_region(dev, res_ecio->start, EXT_ECIO_EXTENT,
 					 DRVNAME)) {
@@ -5505,174 +5498,173 @@ static int it87_probe(struct platform_device *pdev)
 	}
 
 	/* Map Memory resources for MMIO */
-    res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-    if (res_mmio)
-    {
-        data->mmio = devm_ioremap_resource(dev, res_mmio);
-        if (IS_ERR(data->mmio))
-            return PTR_ERR(data->mmio);
-    }
-    else
-    {
-        data->mmio = NULL;
-    }
+	res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (res_mmio)
+	{
+		data->mmio = devm_ioremap_resource(dev, res_mmio);
+		if (IS_ERR(data->mmio))
+			return PTR_ERR(data->mmio);
+	}
+	else
+	{
+		data->mmio = NULL;
+	}
 
-    if(res_io)
+	if(res_io)
 		data->addr = res_io->start;
 	else
 		data->addr = 0;    /* no conventional EC I/O available */
-    data->type              = sio_data->type;
-    data->sioaddr           = sio_data->sioaddr;
-    data->smbus_bitmap      = sio_data->smbus_bitmap;
-    data->ec_special_config = sio_data->ec_special_config;
-    data->features          = it87_devices[sio_data->type].features;
-    data->num_temp_limit    = it87_devices[sio_data->type].num_temp_limit;
-    data->num_temp_offset   = it87_devices[sio_data->type].num_temp_offset;
-    data->pwm_num_temp_map  = it87_devices[sio_data->type].num_temp_map;
-    data->peci_mask         = it87_devices[sio_data->type].peci_mask;
-    data->old_peci_mask     = it87_devices[sio_data->type].old_peci_mask;
-    data->mmio_bridge       = sio_data->mmio_bridge;
-    data->mmio_h2ram        = sio_data->mmio_h2ram;
-    data->ecio_h2ram        = sio_data->ecio_h2ram;
+	data->type              = sio_data->type;
+	data->sioaddr           = sio_data->sioaddr;
+	data->smbus_bitmap      = sio_data->smbus_bitmap;
+	data->ec_special_config = sio_data->ec_special_config;
+	data->features          = it87_devices[sio_data->type].features;
+	data->num_temp_limit    = it87_devices[sio_data->type].num_temp_limit;
+	data->num_temp_offset   = it87_devices[sio_data->type].num_temp_offset;
+	data->pwm_num_temp_map  = it87_devices[sio_data->type].num_temp_map;
+	data->peci_mask         = it87_devices[sio_data->type].peci_mask;
+	data->old_peci_mask     = it87_devices[sio_data->type].old_peci_mask;
+	data->mmio_bridge       = sio_data->mmio_bridge;
+	data->mmio_h2ram        = sio_data->mmio_h2ram;
+	data->ecio_h2ram        = sio_data->ecio_h2ram;
 
-    switch(data->type)
-    {
-    case it87:
-        if (sio_data->revision >= 0x03)
-        {
-            data->features &= ~FEAT_OLD_AUTOPWM;
-            data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS;
-        }
-        break;
-    case it8712:
-        if (sio_data->revision >= 0x08)
-        {
-            data->features &= ~FEAT_OLD_AUTOPWM;
-            data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS |
-                              FEAT_FIVE_FANS;
-        }
-        break;
-    default:
-        break;
-    }
+	switch(data->type)
+	{
+	case it87:
+		if (sio_data->revision >= 0x03)
+		{
+			data->features &= ~FEAT_OLD_AUTOPWM;
+			data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS;
+		}
+		break;
+	case it8712:
+		if (sio_data->revision >= 0x08)
+		{
+			data->features &= ~FEAT_OLD_AUTOPWM;
+			data->features |= FEAT_FAN16_CONFIG | FEAT_16BIT_FANS |
+			      FEAT_FIVE_FANS;
+		}
+		break;
+	default:
+		break;
+	}
 
-    platform_set_drvdata(pdev, data);
-    mutex_init(&data->update_lock);
+	platform_set_drvdata(pdev, data);
+	mutex_init(&data->update_lock);
 
-    /* Initialize register accessors (select IO vs MMIO backend) */
-    it87_init_regs(pdev);
+	/* Initialize register accessors (select IO vs MMIO backend) */
+	it87_init_regs(pdev);
 
-    /* Disable SMBus shadowing while probing sensor blocks */
-    err = smbus_disable(data);
-    if (err)
-        return err;
+	/* Disable SMBus shadowing while probing sensor blocks */
+	err = smbus_disable(data);
+	if (err)
+		return err;
 
-    if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
+	if ((data->read(data, IT87_REG_CONFIG) & 0x80) ||
        data->read(data, IT87_REG_CHIPID) != 0x90)
-    {
-        smbus_enable(data);
-        return -ENODEV;
-    }
+	{
+		smbus_enable(data);
+		return -ENODEV;
+	}
 
-    enable_pwm_interface = it87_check_pwm(dev);
-    if (!enable_pwm_interface)
-        dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
+	enable_pwm_interface = it87_check_pwm(dev);
+	if (!enable_pwm_interface)
+		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
 
-    if (has_scaling(data))
-    {
-        if (sio_data->internal & BIT(0))
-            data->in_scaled |= BIT(3);   /* in3 is AVCC */
-        if (sio_data->internal & BIT(1))
-            data->in_scaled |= BIT(7);   /* in7 is VSB */
-        if (sio_data->internal & BIT(2))
-            data->in_scaled |= BIT(8);   /* in8 is Vbat */
-        if (sio_data->internal & BIT(3))
-            data->in_scaled |= BIT(9);   /* in9 is AVCC */
-    }
-    else if (sio_data->type == it8781 || sio_data->type == it8782 || sio_data->type == it8783)
-    {
-        if (sio_data->internal & BIT(0))
-            data->in_scaled |= BIT(3);   /* in3 is VCC5V */
-        if (sio_data->internal & BIT(1))
-            data->in_scaled |= BIT(7);   /* in7 is VCCH5V */
-    }
+	if (has_scaling(data))
+	{
+		if (sio_data->internal & BIT(0))
+			data->in_scaled |= BIT(3);   /* in3 is AVCC */
+		if (sio_data->internal & BIT(1))
+			data->in_scaled |= BIT(7);   /* in7 is VSB */
+		if (sio_data->internal & BIT(2))
+			data->in_scaled |= BIT(8);   /* in8 is Vbat */
+		if (sio_data->internal & BIT(3))
+			data->in_scaled |= BIT(9);   /* in9 is AVCC */
+	}
+	else if (sio_data->type == it8781 || sio_data->type == it8782 || sio_data->type == it8783)
+	{
+		if (sio_data->internal & BIT(0))
+			data->in_scaled |= BIT(3);   /* in3 is VCC5V */
+		if (sio_data->internal & BIT(1))
+			data->in_scaled |= BIT(7);   /* in7 is VCCH5V */
+	}
 
-    data->has_temp = 0x07;
-    if (sio_data->skip_temp & BIT(2))
-    {
-        if (sio_data->type == it8782 &&
-           !(data->read(data, IT87_REG_TEMP_EXTRA) & 0x80))
-            data->has_temp &= ~BIT(2);
-    }
+	data->has_temp = 0x07;
+	if (sio_data->skip_temp & BIT(2))
+	{
+		if (sio_data->type == it8782 &&
+	   !(data->read(data, IT87_REG_TEMP_EXTRA) & 0x80))
+			data->has_temp &= ~BIT(2);
+	}
 
-    data->in_internal      = sio_data->internal;
-    data->need_in7_reroute = sio_data->need_in7_reroute;
-    data->has_in           = 0x3ff & ~sio_data->skip_in;
+	data->in_internal      = sio_data->internal;
+	data->need_in7_reroute = sio_data->need_in7_reroute;
+	data->has_in           = 0x3ff & ~sio_data->skip_in;
 
-    if (has_four_temp(data))
-    {
-        data->has_temp |= BIT(3);
-    }
-    else if (has_six_temp(data))
-    {
-        if (sio_data->type == it8655 || sio_data->type == it8665)
-        {
-            data->has_temp |= BIT(3) | BIT(4) | BIT(5);
-        }
-        else
-        {
-            u8 reg = data->read(data, IT87_REG_TEMP456_ENABLE);
+	if (has_four_temp(data))
+	{
+		data->has_temp |= BIT(3);
+	}
+	else if (has_six_temp(data))
+	{
+		if (sio_data->type == it8655 || sio_data->type == it8665)
+		{
+			data->has_temp |= BIT(3) | BIT(4) | BIT(5);
+		}
+		else
+		{
+			u8 reg = data->read(data, IT87_REG_TEMP456_ENABLE);
 
-            if ((reg & 0x03) >= 0x02)
-                data->has_temp |= BIT(3);
-            if (((reg >> 2) & 0x03) >= 0x02)
-                data->has_temp |= BIT(4);
-            if (((reg >> 4) & 0x03) >= 0x02)
-                data->has_temp |= BIT(5);
+			if ((reg & 0x03) >= 0x02)
+				data->has_temp |= BIT(3);
+			if (((reg >> 2) & 0x03) >= 0x02)
+				data->has_temp |= BIT(4);
+			if (((reg >> 4) & 0x03) >= 0x02)
+				data->has_temp |= BIT(5);
 
-            if ((reg & 0x03) == 0x01)
-                data->has_in |= BIT(10);
-            if (((reg >> 2) & 0x03) == 0x01)
-                data->has_in |= BIT(11);
-            if (((reg >> 4) & 0x03) == 0x01)
-                data->has_in |= BIT(12);
-        }
-    }
+			if ((reg & 0x03) == 0x01)
+				data->has_in |= BIT(10);
+			if (((reg >> 2) & 0x03) == 0x01)
+				data->has_in |= BIT(11);
+			if (((reg >> 4) & 0x03) == 0x01)
+				data->has_in |= BIT(12);
+		}
+	}
 
-    data->has_beep = !!sio_data->beep_pin;
+	data->has_beep = !!sio_data->beep_pin;
 
-    it87_init_device(pdev);
+	it87_init_device(pdev);
 
-    smbus_enable(data);
+	smbus_enable(data);
 
-    if (!sio_data->skip_vid)
-    {
-        data->has_vid = true;
-        data->vrm     = vid_which_vrm();
-        data->vid     = sio_data->vid_value;
-    }
+	if (!sio_data->skip_vid)
+	{
+		data->has_vid = true;
+		data->vrm     = vid_which_vrm();
+		data->vid     = sio_data->vid_value;
+	}
 
-    data->groups[0] = &it87_group;
-    data->groups[1] = &it87_group_in;
-    data->groups[2] = &it87_group_temp;
-    data->groups[3] = &it87_group_fan;
+	data->groups[0] = &it87_group;
+	data->groups[1] = &it87_group_in;
+	data->groups[2] = &it87_group_temp;
+	data->groups[3] = &it87_group_fan;
 
-    if (enable_pwm_interface)
-    {
-        data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
-        data->has_pwm &= ~sio_data->skip_pwm;
+	if (enable_pwm_interface)
+	{
+		data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
+		data->has_pwm &= ~sio_data->skip_pwm;
 
-        data->groups[4] = &it87_group_pwm;
-        if (has_old_autopwm(data) || has_newer_autopwm(data))
-            data->groups[5] = &it87_group_auto_pwm;
-    }
+		data->groups[4] = &it87_group_pwm;
+		if (has_old_autopwm(data) || has_newer_autopwm(data))
+			data->groups[5] = &it87_group_auto_pwm;
+	}
 
-    hwmon_dev = devm_hwmon_device_register_with_groups(dev,
-                             it87_devices[sio_data->type].name,
-                             data, data->groups);
-    return PTR_ERR_OR_ZERO(hwmon_dev);
+	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
+			     it87_devices[sio_data->type].name,
+			     data, data->groups);
+	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
-
 
 static void it87_resume_sio(struct platform_device *pdev)
 {
@@ -5723,10 +5715,10 @@ static int it87_resume(struct device *dev)
 	it87_check_voltage_monitors_reset(data);
 	it87_check_tachometers_reset(pdev);
 	it87_check_tachometers_16bit_mode(pdev);
-	
+
 	if (data->mmio_h2ram || data->ecio_h2ram) {
-        it87_update_smartfan_global(data);
-    }
+		it87_update_smartfan_global(data);
+	}
 
 	it87_start_monitoring(data);
 
@@ -5751,15 +5743,15 @@ static struct platform_driver it87_driver = {
 };
 
 static int __init it87_device_add(int index, unsigned short sio_address,
-                                  phys_addr_t mmio_address,
-                                  const struct it87_sio_data *sio_data)
+				  phys_addr_t mmio_address,
+				  const struct it87_sio_data *sio_data)
 {
-    struct platform_device *pdev;
-    struct resource res[3];
-    int nres = 0;
-    int err;
+	struct platform_device *pdev;
+	struct resource res[3];
+	int nres = 0;
+	int err;
 
-    memset(res, 0, sizeof(res));
+	memset(res, 0, sizeof(res));
 
 	/* Only allocate IO Ports if we don't use MMIO */
 	if (!((sio_data->mmio_bridge || sio_data->mmio) && mmio_address)) {
@@ -5806,59 +5798,59 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		}
 	}
 
-    /* Secondary MMIO Resource*/
-    if (mmio_address)
-    {
-        phys_addr_t start = mmio_address;
-        phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
+	/* Secondary MMIO Resource*/
+	if (mmio_address)
+	{
+		phys_addr_t start = mmio_address;
+		phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
-        /* H2RAM chips have an extra EC/HWM block mapped into the window
-         * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
-        if (sio_data->mmio_h2ram)
-        {
-            start = mmio_address;
-            end   = mmio_address + H2RAM_HI_BOUND;
-        }
+		/* H2RAM chips have an extra EC/HWM block mapped into the window
+	 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
+		if (sio_data->mmio_h2ram)
+		{
+			start = mmio_address;
+			end   = mmio_address + H2RAM_HI_BOUND;
+		}
 
-        res[nres].name  = DRVNAME;
-        res[nres].start = start;
-        res[nres].end   = end;
-        res[nres].flags = IORESOURCE_MEM;
-        nres++;
-    }
+		res[nres].name  = DRVNAME;
+		res[nres].start = start;
+		res[nres].end   = end;
+		res[nres].flags = IORESOURCE_MEM;
+		nres++;
+	}
 
-    pdev = platform_device_alloc(DRVNAME, sio_address);
-    if (!pdev)
-        return -ENOMEM;
+	pdev = platform_device_alloc(DRVNAME, sio_address);
+	if (!pdev)
+		return -ENOMEM;
 
-    err = platform_device_add_resources(pdev, res, nres);
-    if (err)
-    {
-        pr_err("Device resource addition failed (%d)\n", err);
-        goto exit_device_put;
-    }
+	err = platform_device_add_resources(pdev, res, nres);
+	if (err)
+	{
+		pr_err("Device resource addition failed (%d)\n", err);
+		goto exit_device_put;
+	}
 
-    err = platform_device_add_data(pdev, sio_data,
-                                   sizeof(struct it87_sio_data));
-    if (err)
-    {
-        pr_err("Platform data allocation failed\n");
-        goto exit_device_put;
-    }
+	err = platform_device_add_data(pdev, sio_data,
+				   sizeof(struct it87_sio_data));
+	if (err)
+	{
+		pr_err("Platform data allocation failed\n");
+		goto exit_device_put;
+	}
 
-    err = platform_device_add(pdev);
-    if (err)
-    {
-        pr_err("Device addition failed (%d)\n", err);
-        goto exit_device_put;
-    }
+	err = platform_device_add(pdev);
+	if (err)
+	{
+		pr_err("Device addition failed (%d)\n", err);
+		goto exit_device_put;
+	}
 
-    it87_pdev[index] = pdev;
-    return 0;
+	it87_pdev[index] = pdev;
+	return 0;
 
 exit_device_put:
-    platform_device_put(pdev);
-    return err;
+	platform_device_put(pdev);
+	return err;
 }
 
 /* callback function for DMI */
@@ -6031,92 +6023,92 @@ MODULE_DEVICE_TABLE(dmi, it87_dmi_table);
 
 static int __init sm_it87_init(void)
 {
-    int                 sioaddr[2] = { REG_2E, REG_4E };
-    struct it87_sio_data sio_data;
-    unsigned short      isa_address[2];
-    phys_addr_t         mmio_address;
-    bool                found = false;
-    int                 i, err;
+	int                 sioaddr[2] = { REG_2E, REG_4E };
+	struct it87_sio_data sio_data;
+	unsigned short      isa_address[2];
+	phys_addr_t         mmio_address;
+	bool                found = false;
+	int                 i, err;
 
-    pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
+	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
 
-    err = platform_driver_register(&it87_driver);
-    if (err)
-        return err;
+	err = platform_driver_register(&it87_driver);
+	if (err)
+		return err;
 
-    dmi_check_system(it87_dmi_table);
+	dmi_check_system(it87_dmi_table);
 
-    for (i=0; i<ARRAY_SIZE(sioaddr); i++) {
-        memset(&sio_data, 0, sizeof(struct it87_sio_data));
-        isa_address[i] = 0;
-        mmio_address   = 0;
+	for (i=0; i<ARRAY_SIZE(sioaddr); i++) {
+		memset(&sio_data, 0, sizeof(struct it87_sio_data));
+		isa_address[i] = 0;
+		mmio_address   = 0;
 
-        err = it87_find(sioaddr[i], &isa_address[i], &mmio_address,
-                        &sio_data, i);
-        if (err || isa_address[i]==0)
-            continue;
+		err = it87_find(sioaddr[i], &isa_address[i], &mmio_address,
+						&sio_data, i);
+		if (err || isa_address[i]==0)
+			continue;
 
-        /*
-         * Don't register second chip if its ISA address matches
-         * the first chip's ISA address.
-         */
-        if (i && isa_address[i]==isa_address[0])
-            continue;
+		/*
+	 * Don't register second chip if its ISA address matches
+	 * the first chip's ISA address.
+	 */
+		if (i && isa_address[i]==isa_address[0])
+			continue;
 
-        /*
-         * If this chip has a valid MMIO address and is marked as using
-         * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
-         * the global H2 manager slot for it.
-         */
-        if (mmio_address &&
-           (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
-            phys_addr_t base = mmio_address;
-            int         slot;
-            int         ret;
+		/*
+	 * If this chip has a valid MMIO address and is marked as using
+	 * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
+	 * the global H2 manager slot for it.
+	 */
+		if (mmio_address &&
+	   (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
+			phys_addr_t base = mmio_address;
+			int         slot;
+			int         ret;
 
-            if (!it87_h2_global_inited) {
-                ret = it87_h2_global_init();
-                if (ret) {
-                    pr_debug("H2RAM global bridge init failed: %d\n",
-                             ret);
-                } else {
-                    it87_h2_global_inited = true;
-                }
-            }
-            if (it87_h2_global_ready) {
-                /* slot 0 = 0x2E, slot 1 = 0x4E */
-                slot = (sioaddr[i]==REG_4E) ? 1 : 0;
-                ret = it87_h2_global_set_slot(slot, base);
-                if (ret) {
-                    pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-                             slot, &base, ret);
-                }
-            }
-        }
+			if (!it87_h2_global_inited) {
+				ret = it87_h2_global_init();
+				if (ret) {
+					pr_debug("H2RAM global bridge init failed: %d\n",
+			     ret);
+				} else {
+					it87_h2_global_inited = true;
+				}
+			}
+			if (it87_h2_global_ready) {
+				/* slot 0 = 0x2E, slot 1 = 0x4E */
+				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
+				ret = it87_h2_global_set_slot(slot, base);
+				if (ret) {
+					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
+			     slot, &base, ret);
+				}
+			}
+		}
 
-        err = it87_device_add(i, isa_address[i], mmio_address, &sio_data);
-        if (err)
-            goto exit_unregister;
-        found = true;
-    }
-    if (!found) {
-        err = -ENODEV;
-        goto exit_unregister;
-    }
+		err = it87_device_add(i, isa_address[i], mmio_address, &sio_data);
+		if (err)
+			goto exit_unregister;
+		found = true;
+	}
+	if (!found) {
+		err = -ENODEV;
+		goto exit_unregister;
+	}
 
-    return 0;
+	return 0;
 
 exit_unregister:
-    platform_driver_unregister(&it87_driver);
-    return err;
+	platform_driver_unregister(&it87_driver);
+	return err;
 }
 
 static void __exit sm_it87_exit(void) {
-    /* NULL check handled by platform_device_unregister */
-    platform_device_unregister(it87_pdev[1]);
-    platform_device_unregister(it87_pdev[0]);
-    it87_h2_global_release();
-    platform_driver_unregister(&it87_driver);
+	/* NULL check handled by platform_device_unregister */
+	platform_device_unregister(it87_pdev[1]);
+	platform_device_unregister(it87_pdev[0]);
+	it87_h2_global_release();
+	platform_driver_unregister(&it87_driver);
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>, Frank Crawford");
@@ -6129,7 +6121,7 @@ module_param(ignore_resource_conflict, bool, 0);
 MODULE_PARM_DESC(ignore_resource_conflict, "Ignore ACPI resource conflict");
 
 module_param(mmio, bool, 0);
-MODULE_PARM_DESC(mmio, "Use MMIO if available");
+MODULE_PARM_DESC(mmio, "Controls MMIO feature, on by default, use mmio=off to disable");
 
 module_param(update_vbat, bool, 0);
 MODULE_PARM_DESC(update_vbat, "Update vbat if set else return powerup value");
