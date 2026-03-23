@@ -220,6 +220,9 @@ static inline void superio_exit(int ioreg, bool noexit)
 static unsigned short force_id[2];
 static unsigned int force_id_cnt;
 
+/* Force ISA base address instead of reading from Super I/O config */
+static unsigned short force_addr;
+
 /* ACPI resource conflicts are ignored if this parameter is set to 1 */
 static bool ignore_resource_conflict;
 
@@ -3152,8 +3155,16 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 		enabled = true;
 		/* and then try again */
 		chip_type = superio_inw(sioaddr, DEVID);
-		if (chip_type == 0xffff)
-			goto exit;
+		if (chip_type == 0xffff) {
+			/* Allow force_id + force_addr to bypass detection */
+			if (force_id[0] && force_addr) {
+				chip_type = force_id[0];
+				pr_info("SIO detection failed, using force_id=0x%04x force_addr=0x%04x\n",
+					force_id[0], force_addr);
+			} else {
+				goto exit;
+			}
+		}
 	}
 
 	if (force_id_cnt == 1) {
@@ -3297,6 +3308,11 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 	}
 
 	*address = superio_inw(sioaddr, IT87_BASE_REG) & ~(IT87_EXTENT - 1);
+	if (force_addr) {
+		pr_info("Forcing base address from 0x%x to 0x%x\n",
+			*address, force_addr);
+		*address = force_addr;
+	}
 	if (*address == 0) {
 		pr_info("Base address not set (chip %s ioreg 0x%x), skipping\n",
 			config->model, sioaddr);
@@ -4712,6 +4728,9 @@ MODULE_DESCRIPTION("IT87xxF/IT86xxE hardware monitoring driver");
 
 module_param_array(force_id, ushort, &force_id_cnt, 0);
 MODULE_PARM_DESC(force_id, "Override one or more detected device ID(s)");
+
+module_param(force_addr, ushort, 0);
+MODULE_PARM_DESC(force_addr, "Force ISA base address (e.g., 0x0a40)");
 
 module_param(ignore_resource_conflict, bool, 0);
 MODULE_PARM_DESC(ignore_resource_conflict, "Ignore ACPI resource conflict");
