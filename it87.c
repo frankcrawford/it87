@@ -223,6 +223,9 @@ static unsigned int force_id_cnt;
 /* ACPI resource conflicts are ignored if this parameter is set to 1 */
 static bool ignore_resource_conflict;
 
+/* Force activation of environment controller on chips left inactive by BIOS */
+static bool force_activate;
+
 /* If set the driver uses MMIO to access the chip if supported */
 static bool mmio;
 
@@ -3291,9 +3294,16 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 
 	superio_select(sioaddr, PME);
 	if (!(superio_inb(sioaddr, IT87_ACT_REG) & 0x01)) {
-		pr_info("Device (chip %s ioreg 0x%x) not activated, skipping\n",
-			config->model, sioaddr);
-		goto exit;
+		if (force_activate) {
+			pr_info("Activating chip %s ioreg 0x%x (force_activate=1)\n",
+				config->model, sioaddr);
+			superio_outb(sioaddr, IT87_ACT_REG,
+				     superio_inb(sioaddr, IT87_ACT_REG) | 0x01);
+		} else {
+			pr_info("Device (chip %s ioreg 0x%x) not activated, skipping\n",
+				config->model, sioaddr);
+			goto exit;
+		}
 	}
 
 	*address = superio_inw(sioaddr, IT87_BASE_REG) & ~(IT87_EXTENT - 1);
@@ -4715,6 +4725,9 @@ MODULE_PARM_DESC(force_id, "Override one or more detected device ID(s)");
 
 module_param(ignore_resource_conflict, bool, 0);
 MODULE_PARM_DESC(ignore_resource_conflict, "Ignore ACPI resource conflict");
+
+module_param(force_activate, bool, 0);
+MODULE_PARM_DESC(force_activate, "Force activation of chips the BIOS left disabled");
 
 module_param(mmio, bool, 0);
 MODULE_PARM_DESC(mmio, "Use MMIO if available");
