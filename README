@@ -1,5 +1,5 @@
 it87 is a driver designed to enable monitoring and control of ITE Super I/O chips.
-These chips are typically found on Gigabyte motherboards though they've also been use on others.
+These chips are typically found on Gigabyte motherboards though they've also been seen on others.
 This driver enables temperature, voltage, and fan monitoring/control.
 
 Building & Installing
