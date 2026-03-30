@@ -152,9 +152,10 @@ If you truly want/need fan control for these boards set this curve in the BIOS f
 \*------|----|----|----|----|----|----|----*/
 
 CHANGELOG:
-----------
+=========
 
 SUPPORT NOTE - Mar 2026
+============
 
 The driver has been updated to include new MMIO bridge features.
 These features are required to enable control of fans on certain Super I/O Chips.
