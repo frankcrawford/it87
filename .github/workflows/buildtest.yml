@@ -1,0 +1,25 @@
+name: Makefile CI
+
+on:
+  push:
+    branches: [ "master", "akmods" ]
+  pull_request:
+    branches: [ "master", "akmods" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt install -y linux-headers-$(uname -r)
+
+    - name: Clean
+      run: make clean
+
+    - name: Build
+      run: make modules

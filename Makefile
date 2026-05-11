@@ -6,6 +6,7 @@ endif
 #TARGET = 2.6.33.5
 
 KERNEL_MODULES = /lib/modules/$(TARGET)
+MODPROBED = /usr/lib/modprobe.d
 
 ifneq ("","$(wildcard /usr/src/linux-headers-$(TARGET)/*)")
 # Ubuntu
@@ -27,7 +28,7 @@ else
 SYSTEM_MAP = /proc/kallsyms
 endif
 
-DRIVER := it87
+DRIVER := it87-extras
 # If DRIVER_VERSION is provided (e.g. from dkms-install.sh), don't override it.
 ifndef DRIVER_VERSION
 # Prefer a VERSION file if it exists (e.g. in /usr/src/it87-<version>)
@@ -57,6 +58,7 @@ MODDESTDIR=$(KERNEL_MODULES)/kernel/$(MOD_SUBDIR)
 
 obj-m = $(patsubst %,%.o,$(DRIVER))
 obj-ko  := $(patsubst %,%.ko,$(DRIVER))
+$(patsubst %,%-objs,$(DRIVER)) := it87.o
 
 MAKEFLAGS += --no-print-directory
 
@@ -95,6 +97,7 @@ ifeq ($(COMPRESS_XZ), y)
 	@xz -f -C crc32 $(MODDESTDIR)/$(DRIVER).ko
 endif
 	depmod -a -F $(SYSTEM_MAP) $(TARGET)
+	@cp ./install/modprobe.conf $(MODPROBED)/it87-extras.conf
 
 dkms:
 	@mkdir -p $(DKMS_ROOT_PATH)
@@ -107,6 +110,8 @@ dkms:
 	@dkms add -m $(DRIVER) -v $(DRIVER_VERSION)
 	@dkms build -m $(DRIVER) -v $(DRIVER_VERSION) -k $(TARGET)
 	@dkms install --force -m $(DRIVER) -v $(DRIVER_VERSION) -k $(TARGET)
+	@cp ./install/modprobe.conf $(MODPROBED)/it87-extras.conf
+	@modprobe -r it87
 	@modprobe $(DRIVER)
 
 dkms_clean:
@@ -115,3 +120,4 @@ dkms_clean:
 	fi
 	@dkms remove -m $(DRIVER) -v $(DRIVER_VERSION) --all
 	@rm -rf $(DKMS_ROOT_PATH)
+	@rm -f $(MODPROBED)/it87-extras.conf
