@@ -317,6 +317,7 @@ static bool update_vbat;
 
 /* Not all BIOSes properly configure the PWM registers */
 static bool fix_pwm_polarity;
+static bool force_pwm;
 
 /* Many IT87 constants specified below */
 
@@ -5411,6 +5412,25 @@ static int it87_check_pwm(struct device *dev)
 	 */
 	int tmp = data->read(data, IT87_REG_FAN_CTL);
 
+	/*
+	 * Counterpart to fix_pwm_polarity for boards that need active-low.
+	 * Some units (notably certain NAS systems) deliberately leave the fans
+	 * off with active-low polarity, which trips the broken-BIOS check below
+	 * even though the configuration is fine; on those boards fix_pwm_polarity
+	 * would invert fan control. force_pwm instead enables the PWM interface
+	 * while keeping the BIOS active-low polarity. It runs before the check so
+	 * it forces a deterministic state regardless of current register
+	 * contents, which the userspace detection helper in the README relies on.
+	 * Misapplying it inverts fan control, so it is DANGEROUS and off by
+	 * default.
+	 */
+	if (force_pwm) {
+		dev_info(dev, "Enabling PWM, forcing BIOS active-low polarity\n");
+		/* clear polarity bit (active-low), set the 3 fan main-control bits */
+		data->write(data, IT87_REG_FAN_CTL, (tmp & ~0x80) | 0x07);
+		return 1;
+	}
+
 	if ((tmp & 0x87) == 0) {
 		if (fix_pwm_polarity) {
 			/*
@@ -5569,7 +5589,7 @@ static int it87_probe(struct platform_device *pdev)
 
 	enable_pwm_interface = it87_check_pwm(dev);
 	if (!enable_pwm_interface)
-		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
+		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface (see fix_pwm_polarity and force_pwm parameters)\n");
 
 	if (has_scaling(data))
 	{
@@ -6129,6 +6149,9 @@ MODULE_PARM_DESC(update_vbat, "Update vbat if set else return powerup value");
 module_param(fix_pwm_polarity, bool, 0);
 MODULE_PARM_DESC(fix_pwm_polarity,
 		 "Force PWM polarity to active high (DANGEROUS)");
+module_param(force_pwm, bool, 0);
+MODULE_PARM_DESC(force_pwm,
+		 "Enable PWM interface keeping BIOS active-low polarity (DANGEROUS)");
 
 MODULE_LICENSE("GPL");
 MODULE_VERSION(IT87_DRIVER_VERSION);
