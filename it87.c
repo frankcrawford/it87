@@ -3230,10 +3230,21 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		if (has_newer_autopwm(data)) {
 			ctrl = temp_map_to_reg(data, nr,
 					       data->pwm_temp_map[nr]);
-			if (val == 1)
-				ctrl &= 0x7f;
-			else
+			if (val == 1) {
+				/*
+				 * it8689/it8696/it8698 (FEAT_BRIDGE_MMIO) keep
+				 * running the temp-map "vector" controller in
+				 * manual mode unless every map-select bit is set,
+				 * so they ignore the manual duty written to the
+				 * EXT (PWM_DUTY) register. Writing 0x7f to the base
+				 * PWM control register releases that override (this
+				 * is what LibreHardwareMonitor does on Windows).
+				 * Other newer chips keep their existing behavior.
+				 */
+				ctrl = data->mmio_bridge ? 0x7f : (ctrl & 0x7f);
+			} else {
 				ctrl |= 0x80;
+			}
 		} else {
 			ctrl = (val == 1 ? data->pwm_duty[nr] : 0x80);
 		}
