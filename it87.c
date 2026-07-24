@@ -1152,6 +1152,7 @@ done:
 	return ret;
 }
 
+#ifdef IT87_FUTURE_USE
 /* Get LID */
 static int gbw_lid(u32 *lid)
 {
@@ -1162,6 +1163,7 @@ static int gbw_lid(u32 *lid)
 	*lid = (u32)(v & 0xffffffffu);
 	return 0;
 }
+#endif
 
 /* Get SIV */
 static int gbw_siv(u32 *siv)
@@ -1174,6 +1176,7 @@ static int gbw_siv(u32 *siv)
 	return 0;
 }
 
+#ifdef IT87_FUTURE_USE
 /* Simple DMI check: returns true if the system/vendor strings contain "Gigabyte" */
 static bool mb_is_gigabyte(void)
 {
@@ -1185,6 +1188,7 @@ static bool mb_is_gigabyte(void)
 		return true;
 	return false;
 }
+#endif
 
 /* Parse low 32-bit MGID/SIV into fields */
 static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
@@ -1230,6 +1234,7 @@ static int gbw_siv_platform_id(u8 *platform)
 	return 0;
 }
 
+#ifdef IT87_FUTURE_USE
 static int gbw_siv_fan_count(u8 *count)
 {
 	struct gbw_mgid_info info;
@@ -1239,7 +1244,9 @@ static int gbw_siv_fan_count(u8 *count)
 	*count = info.fan_count;
 	return 0;
 }
+#endif
 
+#ifdef IT87_FUTURE_USE
 static int gbw_siv_temp_count(u8 *count)
 {
 	struct gbw_mgid_info info;
@@ -1249,7 +1256,9 @@ static int gbw_siv_temp_count(u8 *count)
 	*count = info.temp_count;
 	return 0;
 }
+#endif
 
+#ifdef IT87_FUTURE_USE
 static int gbw_siv_volt_count(u8 *count)
 {
 	struct gbw_mgid_info info;
@@ -1259,6 +1268,7 @@ static int gbw_siv_volt_count(u8 *count)
 	*count = info.volt_count;
 	return 0;
 }
+#endif
 /* End of Gigabyte SIV/LID retrieval routines */
 
 /* Board specific settings from DMI matching */
