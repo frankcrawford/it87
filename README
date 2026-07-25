@@ -60,6 +60,15 @@ Module Parameters
   misconfigured by BIOS - PWM values would be inverted. This option tries
   to fix this. Please contact your BIOS manufacturer and ask him for fix.
 
+* force_pwm
+
+  Counterpart to fix_pwm_polarity for boards that need active low.
+  Some units (notably certain NAS systems) deliberately leave the fans
+  off with active-low polarity, which trips the broken-BIOS check
+  even if the configuration is fine. force_pwm enables the PWM interface
+  while keeping the BIOS active-low polarity. Misapplying it inverts fan 
+  control, so it is DANGEROUS and off by by default.
+
 * force_id [short, short]
 
   Force multiple chip ID to specified value, separated by `,'.
@@ -128,6 +137,42 @@ Device Support
  *            IT8792E  Super I/O chip w/LPC interface
  *            IT87952E  Super I/O chip w/LPC interface
  *            Sis950   A clone of the IT8705F
+
+Fan control disabled: "Detected broken BIOS defaults"
+-----------------------------------------------------
+
+If `dmesg` shows a line like:
+
+    it87 it87.656: Detected broken BIOS defaults, disabling PWM interface
+
+and no `pwmN` files appear under the chip's `hwmon` directory (you can read
+fan RPM but cannot set fan speed), then run `test_pwm_polarity.sh` 
+(included in this repo) as root:
+
+    sudo ./test_pwm_polarity.sh
+
+It loads the driver with `force_pwm`, drives the fan to full and to off, reads
+the tachometer, and reports whether you want `force_pwm`, `fix_pwm_polarity`,
+or that PWM cannot be made to work on your board. If your board needs extra
+load-time parameters (for example `ignore_resource_conflict=1`), pass them
+through with the `IT87_PARAMS` environment variable:
+
+    sudo IT87_PARAMS="ignore_resource_conflict=1" ./test_pwm_polarity.sh
+
+The script changes nothing permanent and restores the fan to its hardware
+default on exit. If you run a fan-control daemon (fancontrol or your own
+service), stop it first so it does not fight the script for the pwm.
+
+Once you know which parameter your board needs, set it so the module loads
+that way every boot. Create `/etc/modprobe.d/it87.conf`:
+
+    options it87 force_pwm=1
+
+Substitute `fix_pwm_polarity=1` if that was the result, and append any other
+parameters your board requires, for example:
+
+    options it87 ignore_resource_conflict=1 force_pwm=1
+
 
 TODOS:
 ------
