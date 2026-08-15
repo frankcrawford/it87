@@ -5272,7 +5272,7 @@ static void it87_check_tachometers_reset(struct platform_device *pdev)
 	if ((fan_main_ctrl & mask) == 0) {
 		/* Enable all fan tachometers */
 		fan_main_ctrl |= mask;
-		data->write(data, IT87_REG_FAN_MAIN_CTRL, data->fan_main_ctrl);
+		data->write(data, IT87_REG_FAN_MAIN_CTRL, fan_main_ctrl);
 	}
 }
 
