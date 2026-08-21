@@ -154,6 +154,21 @@ If you truly want/need fan control for these boards set this curve in the BIOS f
 CHANGELOG:
 =========
 
+SUPPORT NOTE - Aug 2026
+============
+
+The driver has been updated to use Gigabyte SMI commands rather than WMI.
+This change is necessary to provide proper support for MMIO on boards without WMI.
+
+This board also adds two userspace readable sysfs entries. This is to facilitate feature support for cooling and RGB control applications.
+Here are the pathways and their uses.
+
+SIV (superio configuration and mapping):
+"/sys/devices/virtual/gigabyte/id/gigabyte_siv"
+LID (RGB controller configuration and mapping):
+"/sys/devices/virtual/gigabyte/id/gigabyte_lid"
+
+
 SUPPORT NOTE - Mar 2026
 ============
 

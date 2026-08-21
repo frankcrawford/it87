@@ -71,15 +71,16 @@
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/preempt.h>
 #include <linux/sysfs.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
 #include <linux/pci.h>
 #include <asm/processor.h>
 #include <asm/intel-family.h>
+#include <asm/irqflags.h>
 #include <linux/acpi.h>
 #include <linux/io.h>
-#include <linux/wmi.h>
 #include "compat.h"
 
 /* Defines fallbacks for processor models */
@@ -114,9 +115,9 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 
 static struct platform_device *it87_pdev[2];
 
-/* Gigabyte WMI Driver ID's */
-#define GIGABYTE_WMI_GUID                 "DEADBEEF-2001-0000-00A0-C90629100000"
-#define GIGABYTE_WMI_GET_HW_CFG_QUERY     0x0A
+#define GIGABYTE_SMI_PORT        0xB2
+#define GIGABYTE_SMI_CMD_SIV_ID  0xB364
+#define GIGABYTE_SMI_CMD_LED_ID  0xB464
 
 #define	REG_2E	0x2e	/* The register to read/write */
 #define	REG_4E	0x4e	/* Secondary register to read/write */
@@ -1077,11 +1078,32 @@ struct it87_data {
 	s8 auto_temp[NUM_AUTO_PWM][5];	/* [nr][0] is point1_temp_hyst */
 };
 
-/* Gigabyte has two ID numbers present in WMI.
- * We need those for feature detection */
-/* Gigabyte WMI Argument */
-struct gb_wmi_args {
-	u32 arg1; /* page */
+struct gigabyte_smi_regs {
+	u64 rax;
+	u64 rbx;
+	u64 rcx;
+	u64 rdx;
+	u64 rsi;
+	u64 rdi;
+};
+
+static DEFINE_MUTEX(gigabyte_smi_lock);
+
+static u32 gigabyte_siv;
+static u32 gigabyte_lid;
+static bool gigabyte_siv_valid;
+static bool gigabyte_lid_valid;
+static struct class *gigabyte_class;
+static struct device *gigabyte_dev;
+
+static const struct dmi_system_id gigabyte_dmi_table[] = {
+	{
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR,
+				  "Gigabyte Technology Co., Ltd."),
+		},
+	},
+	{ }
 };
 
 /* Parsed SIV/MGID description */
@@ -1095,100 +1117,74 @@ struct gbw_mgid_info {
 	bool supported;   /* platform != 0 and group != 0 */
 };
 
-/* Get raw SIV/LID from WMI */
-static int gbw_hwcfg_u64(u8 page, u64 *res)
+static int gigabyte_smi_call(struct gigabyte_smi_regs *regs)
 {
-	const struct gb_wmi_args args = { .arg1 = page };
-	const struct acpi_buffer in = { .length = sizeof(args), .pointer = (void *)&args };
-	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	acpi_status status;
-	int ret = 0;
+	unsigned long flags;
+	u64 cmd;
+	u64 status;
 
-	if (!res)
+	if (!regs)
 		return -EINVAL;
 
-	status = wmi_evaluate_method(GIGABYTE_WMI_GUID, 0,
-				 GIGABYTE_WMI_GET_HW_CFG_QUERY, &in, &out);
-	if (ACPI_FAILURE(status))
+	cmd = regs->rax;
+
+	mutex_lock(&gigabyte_smi_lock);
+	preempt_disable();
+	local_irq_save(flags);
+
+	asm volatile(
+		"outb %%al, %%dx\n\t"
+		"outb %%al, $0xeb\n\t"
+		"outb %%al, $0xeb\n\t"
+		: "+a"(regs->rax), "+b"(regs->rbx), "+c"(regs->rcx),
+		  "+d"(regs->rdx), "+S"(regs->rsi), "+D"(regs->rdi)
+		:
+		: "memory"
+	);
+
+	local_irq_restore(flags);
+	preempt_enable();
+	status = regs->rax;
+	mutex_unlock(&gigabyte_smi_lock);
+
+	if (status != 0) {
+		pr_err("Gigabyte SMI call failed, cmd=0x%04llX status=0x%016llX\n",
+		       cmd & 0xffffULL, status);
 		return -EIO;
-
-	obj = out.pointer;
-	if (!obj) {
-		ret = -EIO;
-		goto done;
 	}
 
-	switch (obj->type) {
-	case ACPI_TYPE_INTEGER:
-		*res = obj->integer.value;
-		break;
-	case ACPI_TYPE_BUFFER:
-		if (!obj->buffer.pointer || obj->buffer.length < 8) {
-			ret = -EIO;
-			break;
-		} else {
-			const u8 *p = obj->buffer.pointer;
-			*res = (u64)p[0]
-		 | ((u64)p[1] << 8)
-		 | ((u64)p[2] << 16)
-		 | ((u64)p[3] << 24)
-		 | ((u64)p[4] << 32)
-		 | ((u64)p[5] << 40)
-		 | ((u64)p[6] << 48)
-		 | ((u64)p[7] << 56);
-		}
-		break;
-	default:
-		ret = -EIO;
-		break;
-	}
-
-	if (!ret && *res == 0)
-		ret = -ENODEV; /* zero means not present */
-
-done:
-	kfree(out.pointer);
-	return ret;
-}
-
-#ifdef IT87_FUTURE_USE
-/* Get LID */
-static int gbw_lid(u32 *lid)
-{
-	u64 v = 0;
-	int ret = gbw_hwcfg_u64(0x08, &v);
-	if (ret)
-		return ret;
-	*lid = (u32)(v & 0xffffffffu);
 	return 0;
 }
-#endif
 
-/* Get SIV */
+static int gigabyte_read_id(u16 cmd, u32 *id)
+{
+	struct gigabyte_smi_regs regs = {
+		.rax = cmd,
+		.rdx = GIGABYTE_SMI_PORT,
+	};
+	int ret;
+
+	if (!id)
+		return -EINVAL;
+
+	ret = gigabyte_smi_call(&regs);
+	if (ret)
+		return ret;
+
+	*id = (u32)(regs.rbx & 0xffffffffULL);
+	return 0;
+}
+
 static int gbw_siv(u32 *siv)
 {
-	u64 v = 0;
-	int ret = gbw_hwcfg_u64(0x04, &v);
-	if (ret)
-		return ret;
-	*siv = (u32)(v & 0xffffffffu);
+	if (!siv)
+		return -EINVAL;
+	if (!gigabyte_siv_valid)
+		return -ENODEV;
+
+	*siv = gigabyte_siv;
 	return 0;
 }
-
-#ifdef IT87_FUTURE_USE
-/* Simple DMI check: returns true if the system/vendor strings contain "Gigabyte" */
-static bool mb_is_gigabyte(void)
-{
-	const char *board_vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
-	const char *sys_vendor = dmi_get_system_info(DMI_SYS_VENDOR);
-
-	if ((board_vendor && strstr(board_vendor, "Gigabyte")) ||
-		(sys_vendor && strstr(sys_vendor, "Gigabyte")))
-		return true;
-	return false;
-}
-#endif
 
 /* Parse low 32-bit MGID/SIV into fields */
 static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
@@ -1213,7 +1209,7 @@ static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
 	return 0;
 }
 
-/* Read SIV via WMI and parse */
+/* Read the cached SIV and parse it. */
 static int gbw_read_siv_info(struct gbw_mgid_info *out)
 {
 	u32 mgid;
@@ -3919,6 +3915,101 @@ static SENSOR_DEVICE_ATTR(in8_label, S_IRUGO, show_label, NULL, 2);
 /* AVCC3 */
 static SENSOR_DEVICE_ATTR(in9_label, S_IRUGO, show_label, NULL, 3);
 
+static ssize_t gigabyte_siv_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (!gigabyte_siv_valid)
+		return sprintf(buf, "unavailable\n");
+
+	return sprintf(buf, "%08X\n", gigabyte_siv);
+}
+
+static ssize_t gigabyte_lid_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (!gigabyte_lid_valid)
+		return sprintf(buf, "unavailable\n");
+
+	return sprintf(buf, "%08X\n", gigabyte_lid);
+}
+
+static DEVICE_ATTR_RO(gigabyte_siv);
+static DEVICE_ATTR_RO(gigabyte_lid);
+
+static struct attribute *gigabyte_id_attributes[] = {
+	&dev_attr_gigabyte_siv.attr,
+	&dev_attr_gigabyte_lid.attr,
+	NULL
+};
+
+static const struct attribute_group gigabyte_id_group = {
+	.attrs = gigabyte_id_attributes,
+};
+
+static int __init gigabyte_ids_init(void)
+{
+	int ret;
+
+	if (!dmi_check_system(gigabyte_dmi_table))
+		return 0;
+
+	gigabyte_siv_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_SIV_ID,
+						       &gigabyte_siv);
+	gigabyte_lid_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_LED_ID,
+						       &gigabyte_lid);
+
+	if (gigabyte_siv_valid)
+		pr_info("Gigabyte SIV ID = %08X\n", gigabyte_siv);
+	else
+		pr_warn("Failed to read Gigabyte SIV ID\n");
+
+	if (gigabyte_lid_valid)
+		pr_info("Gigabyte LID ID = %08X\n", gigabyte_lid);
+	else
+		pr_warn("Failed to read Gigabyte LID ID\n");
+
+	gigabyte_class = class_create("gigabyte");
+	if (IS_ERR(gigabyte_class)) {
+		ret = PTR_ERR(gigabyte_class);
+		gigabyte_class = NULL;
+		return ret;
+	}
+
+	gigabyte_dev = device_create(gigabyte_class, NULL, MKDEV(0, 0), NULL,
+				      "id");
+	if (IS_ERR(gigabyte_dev)) {
+		ret = PTR_ERR(gigabyte_dev);
+		gigabyte_dev = NULL;
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+		return ret;
+	}
+
+	ret = sysfs_create_group(&gigabyte_dev->kobj, &gigabyte_id_group);
+	if (ret) {
+		device_unregister(gigabyte_dev);
+		gigabyte_dev = NULL;
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+	}
+
+	return ret;
+}
+
+static void gigabyte_ids_exit(void)
+{
+	if (gigabyte_dev) {
+		sysfs_remove_group(&gigabyte_dev->kobj, &gigabyte_id_group);
+		device_unregister(gigabyte_dev);
+		gigabyte_dev = NULL;
+	}
+
+	if (gigabyte_class) {
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+	}
+}
+
 static umode_t it87_in_is_visible(struct kobject *kobj,
 				  struct attribute *attr, int index)
 {
@@ -6044,10 +6135,15 @@ static int __init sm_it87_init(void)
 	int                 i, err;
 
 	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
-
-	err = platform_driver_register(&it87_driver);
+	err = gigabyte_ids_init();
 	if (err)
 		return err;
+
+	err = platform_driver_register(&it87_driver);
+	if (err) {
+		gigabyte_ids_exit();
+		return err;
+	}
 
 	dmi_check_system(it87_dmi_table);
 
@@ -6113,6 +6209,7 @@ static int __init sm_it87_init(void)
 
 exit_unregister:
 	platform_driver_unregister(&it87_driver);
+	gigabyte_ids_exit();
 	return err;
 }
 
@@ -6122,6 +6219,7 @@ static void __exit sm_it87_exit(void) {
 	platform_device_unregister(it87_pdev[0]);
 	it87_h2_global_release();
 	platform_driver_unregister(&it87_driver);
+	gigabyte_ids_exit();
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>, Frank Crawford");
