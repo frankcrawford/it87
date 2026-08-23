@@ -71,15 +71,16 @@
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/preempt.h>
 #include <linux/sysfs.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
 #include <linux/pci.h>
 #include <asm/processor.h>
 #include <asm/intel-family.h>
+#include <asm/irqflags.h>
 #include <linux/acpi.h>
 #include <linux/io.h>
-#include <linux/wmi.h>
 #include "compat.h"
 
 /* Defines fallbacks for processor models */
@@ -114,9 +115,9 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 
 static struct platform_device *it87_pdev[2];
 
-/* Gigabyte WMI Driver ID's */
-#define GIGABYTE_WMI_GUID                 "DEADBEEF-2001-0000-00A0-C90629100000"
-#define GIGABYTE_WMI_GET_HW_CFG_QUERY     0x0A
+#define GIGABYTE_SMI_PORT        0xB2
+#define GIGABYTE_SMI_CMD_SIV_ID  0xB364
+#define GIGABYTE_SMI_CMD_LED_ID  0xB464
 
 #define	REG_2E	0x2e	/* The register to read/write */
 #define	REG_4E	0x4e	/* Secondary register to read/write */
@@ -414,8 +415,61 @@ static const u8 IT87_REG_TEMP_LOW_8686[] = {
 #define IT87_REG_BEEP_ENABLE  0x5c
 
 #define IT87_REG_CHIPID       0x58
-/* Smartfan enable bit for it879x superios in MMIO*/
+/* SmartFan enable byte shared by IT879x G3 and its IT57xx extensions. */
 #define IT87_SMARTFAN_ENABLE  0x947
+
+/* IT879x H2RAM SmartFan version bytes. */
+#define IT87_H2RAM_G23_MAJOR  0x900
+#define IT87_H2RAM_G23_MINOR  0x901
+#define IT87_H2RAM_G1_MAJOR   0xa00
+#define IT87_H2RAM_G1_MINOR   0xa01
+
+/* IT57xx extension version bytes.  IT57xx exists only with IT879x G3. */
+#define IT87_IT57XX_MAJOR     0xc00
+#define IT87_IT57XX_MINOR     0xc01
+
+#define IT87_H2RAM_BASE_FANS  3
+#define IT87_H2RAM_MAX_FANS   7
+#define IT87_H2RAM_MAX_EXTRA_VECTORS 9
+
+enum it87_h2ram_smartfan_gen {
+	IT87_H2RAM_SF_NONE = 0,
+	IT87_H2RAM_SF_G1,
+	IT87_H2RAM_SF_G2,
+	IT87_H2RAM_SF_G3,
+};
+
+/* H2RAM PWM feedback bytes for the three IT879x base channels. */
+static const u16 IT87_H2RAM_G23_PWM[] = { 0x911, 0x912, 0x913 };
+
+/* G3 tachometers are authoritative in H2RAM. */
+static const u16 IT87_H2RAM_G3_TACH_LSB[] = { 0x916, 0x918, 0x91a };
+static const u16 IT87_H2RAM_G3_TACH_MSB[] = { 0x917, 0x919, 0x91b };
+
+/* Primary-vector base addresses for the three IT879x base channels. */
+static const u16 IT87_H2RAM_G2_VECTOR[] = { 0x950, 0x960, 0x970 };
+static const u16 IT87_H2RAM_G3_VECTOR[] = { 0x950, 0x980, 0x9b0 };
+
+/*
+ * IT57xx is an extension of IT879x G3, not a separate SmartFan controller.
+ * Version 1.0 exposes two extra channels.  Version 2.0 exposes four, except
+ * that AMD ECIO systems can access only the first two.
+ */
+static const u16 IT87_IT57XX_VECTOR[] = { 0xc30, 0xc60, 0xc90, 0xcc0 };
+static const u16 IT87_IT57XX_V1_TACH_LSB[] = { 0xc0a, 0xc0c };
+static const u16 IT87_IT57XX_V1_TACH_MSB[] = { 0xc0b, 0xc0d };
+static const u16 IT87_IT57XX_V2_TACH_LSB[] = { 0xc10, 0xc12, 0xc14, 0xc16 };
+static const u16 IT87_IT57XX_V2_TACH_MSB[] = { 0xc11, 0xc13, 0xc15, 0xc17 };
+
+/*
+ * IT8688 rev.2 / IT8689 extra-vector enable locations.
+ * Vectors 1..3 use bit 7 in three separate bank-2 bytes.  Vectors 4..9
+ * share bits 0..5 in one bank-3 byte.
+ */
+#define IT87_EXTVEC_B2_ENABLE(nr, vec) \
+	(0x212 + (nr) * 0x10 + (vec) * 4)
+#define IT87_EXTVEC_B3_ENABLE(nr) \
+	(0x31c + (nr) * 0x10)
 
 static const u8 IT87_REG_AUTO_BASE[] = { 0x60, 0x68, 0x70, 0x78, 0xa0, 0xa8 };
 
@@ -430,9 +484,9 @@ static const u16 IT87_REG_TEMP_SRC1[] = { 0x21d, 0x21e, 0x21f };
 #define NUM_VIN			    ARRAY_SIZE(IT87_REG_VIN)
 #define NUM_VIN_LIMIT		8
 #define NUM_TEMP		    6
-#define NUM_FAN			    ARRAY_SIZE(IT87_REG_FAN)
+#define NUM_FAN			    IT87_H2RAM_MAX_FANS
 #define NUM_FAN_DIV		    3
-#define NUM_PWM			    ARRAY_SIZE(IT87_REG_PWM)
+#define NUM_PWM			    IT87_H2RAM_MAX_FANS
 #define NUM_AUTO_PWM	    ARRAY_SIZE(IT87_REG_PWM)
 
 struct it87_devices {
@@ -998,6 +1052,7 @@ struct it87_data {
 	const struct attribute_group *groups[7];
 	enum chips type;
 	u64 features;
+	u8 revision;
 	u8 peci_mask;
 	u8 old_peci_mask;
 
@@ -1010,6 +1065,42 @@ struct it87_data {
 	bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
 	bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
 	bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
+
+	/* IT879x H2RAM SmartFan state. */
+	enum it87_h2ram_smartfan_gen h2ram_sf_gen;
+	u8 h2ram_smartfan_orig;
+	bool h2ram_smartfan_orig_valid;
+	u8 siv_fan_count;
+	u8 it57xx_version;
+	u8 it57xx_fans;
+	u8 h2ram_pwm_mode[IT87_H2RAM_MAX_FANS];
+	bool h2ram_vector_saved[IT87_H2RAM_MAX_FANS];
+	/* start temp, full temp, start PWM, slope LSB, slope MSB */
+	u8 h2ram_primary_saved[IT87_H2RAM_MAX_FANS][5];
+	u8 h2ram_extra_start_saved[IT87_H2RAM_MAX_FANS]
+				      [IT87_H2RAM_MAX_EXTRA_VECTORS];
+
+	/* IT8688r2/IT8689 extra-vector enable state. */
+	bool extvec_enable_saved[NUM_PWM];
+	u8 extvec_saved[NUM_PWM][4];
+
+	/*
+	 * Exact pre-takeover state for conventional PWM channels.  The shared
+	 * FAN_CTL/FAN_MAIN_CTRL bytes are restored one bit at a time so one fan
+	 * returning to firmware control cannot disturb another fan.
+	 */
+	bool pwm_state_saved[NUM_PWM];
+	u8 pwm_ctrl_saved[NUM_PWM];
+	u8 pwm_duty_saved[NUM_PWM];
+	u8 fan_shared_saved_mask;
+	u8 fan_ctl_saved_bits;
+	u8 fan_main_ctrl_saved_bits;
+
+	/* Software ownership survives suspend while hardware is put back safe. */
+	u8 pwm_override_mask;
+	u8 pwm_override_mode[NUM_PWM];
+	u8 pwm_override_duty[NUM_PWM];
+	bool suspend_defaults_restored;
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -1077,11 +1168,32 @@ struct it87_data {
 	s8 auto_temp[NUM_AUTO_PWM][5];	/* [nr][0] is point1_temp_hyst */
 };
 
-/* Gigabyte has two ID numbers present in WMI.
- * We need those for feature detection */
-/* Gigabyte WMI Argument */
-struct gb_wmi_args {
-	u32 arg1; /* page */
+struct gigabyte_smi_regs {
+	u64 rax;
+	u64 rbx;
+	u64 rcx;
+	u64 rdx;
+	u64 rsi;
+	u64 rdi;
+};
+
+static DEFINE_MUTEX(gigabyte_smi_lock);
+
+static u32 gigabyte_siv;
+static u32 gigabyte_lid;
+static bool gigabyte_siv_valid;
+static bool gigabyte_lid_valid;
+static struct class *gigabyte_class;
+static struct device *gigabyte_dev;
+
+static const struct dmi_system_id gigabyte_dmi_table[] = {
+	{
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR,
+				  "Gigabyte Technology Co., Ltd."),
+		},
+	},
+	{ }
 };
 
 /* Parsed SIV/MGID description */
@@ -1095,100 +1207,74 @@ struct gbw_mgid_info {
 	bool supported;   /* platform != 0 and group != 0 */
 };
 
-/* Get raw SIV/LID from WMI */
-static int gbw_hwcfg_u64(u8 page, u64 *res)
+static int gigabyte_smi_call(struct gigabyte_smi_regs *regs)
 {
-	const struct gb_wmi_args args = { .arg1 = page };
-	const struct acpi_buffer in = { .length = sizeof(args), .pointer = (void *)&args };
-	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	acpi_status status;
-	int ret = 0;
+	unsigned long flags;
+	u64 cmd;
+	u64 status;
 
-	if (!res)
+	if (!regs)
 		return -EINVAL;
 
-	status = wmi_evaluate_method(GIGABYTE_WMI_GUID, 0,
-				 GIGABYTE_WMI_GET_HW_CFG_QUERY, &in, &out);
-	if (ACPI_FAILURE(status))
+	cmd = regs->rax;
+
+	mutex_lock(&gigabyte_smi_lock);
+	preempt_disable();
+	local_irq_save(flags);
+
+	asm volatile(
+		"outb %%al, %%dx\n\t"
+		"outb %%al, $0xeb\n\t"
+		"outb %%al, $0xeb\n\t"
+		: "+a"(regs->rax), "+b"(regs->rbx), "+c"(regs->rcx),
+		  "+d"(regs->rdx), "+S"(regs->rsi), "+D"(regs->rdi)
+		:
+		: "memory"
+	);
+
+	local_irq_restore(flags);
+	preempt_enable();
+	status = regs->rax;
+	mutex_unlock(&gigabyte_smi_lock);
+
+	if (status != 0) {
+		pr_err("Gigabyte SMI call failed, cmd=0x%04llX status=0x%016llX\n",
+		       cmd & 0xffffULL, status);
 		return -EIO;
-
-	obj = out.pointer;
-	if (!obj) {
-		ret = -EIO;
-		goto done;
 	}
 
-	switch (obj->type) {
-	case ACPI_TYPE_INTEGER:
-		*res = obj->integer.value;
-		break;
-	case ACPI_TYPE_BUFFER:
-		if (!obj->buffer.pointer || obj->buffer.length < 8) {
-			ret = -EIO;
-			break;
-		} else {
-			const u8 *p = obj->buffer.pointer;
-			*res = (u64)p[0]
-		 | ((u64)p[1] << 8)
-		 | ((u64)p[2] << 16)
-		 | ((u64)p[3] << 24)
-		 | ((u64)p[4] << 32)
-		 | ((u64)p[5] << 40)
-		 | ((u64)p[6] << 48)
-		 | ((u64)p[7] << 56);
-		}
-		break;
-	default:
-		ret = -EIO;
-		break;
-	}
-
-	if (!ret && *res == 0)
-		ret = -ENODEV; /* zero means not present */
-
-done:
-	kfree(out.pointer);
-	return ret;
-}
-
-#ifdef IT87_FUTURE_USE
-/* Get LID */
-static int gbw_lid(u32 *lid)
-{
-	u64 v = 0;
-	int ret = gbw_hwcfg_u64(0x08, &v);
-	if (ret)
-		return ret;
-	*lid = (u32)(v & 0xffffffffu);
 	return 0;
 }
-#endif
 
-/* Get SIV */
+static int gigabyte_read_id(u16 cmd, u32 *id)
+{
+	struct gigabyte_smi_regs regs = {
+		.rax = cmd,
+		.rdx = GIGABYTE_SMI_PORT,
+	};
+	int ret;
+
+	if (!id)
+		return -EINVAL;
+
+	ret = gigabyte_smi_call(&regs);
+	if (ret)
+		return ret;
+
+	*id = (u32)(regs.rbx & 0xffffffffULL);
+	return 0;
+}
+
 static int gbw_siv(u32 *siv)
 {
-	u64 v = 0;
-	int ret = gbw_hwcfg_u64(0x04, &v);
-	if (ret)
-		return ret;
-	*siv = (u32)(v & 0xffffffffu);
+	if (!siv)
+		return -EINVAL;
+	if (!gigabyte_siv_valid)
+		return -ENODEV;
+
+	*siv = gigabyte_siv;
 	return 0;
 }
-
-#ifdef IT87_FUTURE_USE
-/* Simple DMI check: returns true if the system/vendor strings contain "Gigabyte" */
-static bool mb_is_gigabyte(void)
-{
-	const char *board_vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
-	const char *sys_vendor = dmi_get_system_info(DMI_SYS_VENDOR);
-
-	if ((board_vendor && strstr(board_vendor, "Gigabyte")) ||
-		(sys_vendor && strstr(sys_vendor, "Gigabyte")))
-		return true;
-	return false;
-}
-#endif
 
 /* Parse low 32-bit MGID/SIV into fields */
 static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
@@ -1213,7 +1299,7 @@ static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
 	return 0;
 }
 
-/* Read SIV via WMI and parse */
+/* Read the cached SIV and parse it. */
 static int gbw_read_siv_info(struct gbw_mgid_info *out)
 {
 	u32 mgid;
@@ -1234,7 +1320,6 @@ static int gbw_siv_platform_id(u8 *platform)
 	return 0;
 }
 
-#ifdef IT87_FUTURE_USE
 static int gbw_siv_fan_count(u8 *count)
 {
 	struct gbw_mgid_info info;
@@ -1244,7 +1329,6 @@ static int gbw_siv_fan_count(u8 *count)
 	*count = info.fan_count;
 	return 0;
 }
-#endif
 
 #ifdef IT87_FUTURE_USE
 static int gbw_siv_temp_count(u8 *count)
@@ -1292,7 +1376,8 @@ struct it87_h2ram_handle
 	u32 ord8, or98;          	/* Intel: 0xD8 Bridge enable address, 0x98 MMIO Base address */
 	u32 hidden_orig_0x44; 	/* Original mirror D8 at hidden_base+0x44 */
 	u32 hidden_orig_0x40; 	/* Original mirror 98 at hidden_base+0x40 */
-	bool saved;				/* whether original registers have been save */
+	bool saved;				/* original PCI bridge registers are valid */
+	bool hidden_saved;		/* original Intel hidden mirror is valid */
 
 	/* Per-slot requested windows (idx 0=2E, 1=4E), 64KiB aligned */
 	u32 base[2];
@@ -1492,61 +1577,98 @@ static u16 _intel_bios_mask_for_feat_space(u32 base)
 
 /* ----- internal save/restore of original bridge state ----- */
 
-static void _save_regs(struct it87_h2ram_handle *h)
+static int _save_regs(struct it87_h2ram_handle *h)
 {
+	void __iomem *hb;
+	int ret;
 	u16 v;
 
-	if (!h || !h->bridge || h->saved) return;
+	if (!h || !h->bridge)
+		return -EINVAL;
+	if (h->saved)
+		return 0;
 
 	v = h->bridge->vendor;
 	if (v == IT87_H2_VENDOR_AMD) {
-		pci_reg_read(h->bridge, 0x48, &h->or48);
-		pci_reg_read(h->bridge, 0x60, &h->or60);
-		pci_reg_read(h->bridge, 0x6C, &h->or6c);
+		ret = pci_reg_read(h->bridge, 0x48, &h->or48);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x60, &h->or60);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x6C, &h->or6c);
+		if (ret)
+			return ret;
 	} else if (v == IT87_H2_VENDOR_INTEL) {
-		pci_reg_read(h->bridge, 0xD8, &h->ord8);
-		pci_reg_read(h->bridge, 0x98, &h->or98);
+		ret = pci_reg_read(h->bridge, 0xD8, &h->ord8);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x98, &h->or98);
+		if (ret)
+			return ret;
+
 		if (h->hidden_ready && h->hidden_base) {
-			void __iomem *hb = ioremap(h->hidden_base, 0x200);
-			if (hb) {
-				h->hidden_orig_0x40 = readl(hb + 0x40);
-				h->hidden_orig_0x44 = readl(hb + 0x44);
-				iounmap(hb);
-			} else {
-				h->hidden_orig_0x40 = 0;
-				h->hidden_orig_0x44 = 0;
-			}
+			hb = ioremap(h->hidden_base, 0x200);
+			if (!hb)
+				return -ENOMEM;
+
+			h->hidden_orig_0x40 = readl(hb + 0x40);
+			h->hidden_orig_0x44 = readl(hb + 0x44);
+			h->hidden_saved = true;
+			iounmap(hb);
 		}
+	} else {
+		return -ENODEV;
 	}
+
 	h->saved = true;
+	return 0;
 }
 
 static void _restore_regs(struct it87_h2ram_handle *h)
 {
+	void __iomem *hb;
+	int ret;
 	u16 v;
 
-	if (!h || !h->bridge || !h->saved) return;
+	if (!h || !h->bridge || !h->saved)
+		return;
 
 	v = h->bridge->vendor;
 	if (v == IT87_H2_VENDOR_AMD) {
-		pci_reg_write(h->bridge, 0x48, h->or48);
-		pci_reg_write(h->bridge, 0x60, h->or60);
-		pci_reg_write(h->bridge, 0x6C, h->or6c);
-		h->current_base = 0;
+		ret = pci_reg_write(h->bridge, 0x48, h->or48);
+		if (ret)
+			pr_warn("failed to restore AMD bridge register 0x48: %d\n", ret);
+		ret = pci_reg_write(h->bridge, 0x60, h->or60);
+		if (ret)
+			pr_warn("failed to restore AMD bridge register 0x60: %d\n", ret);
+		ret = pci_reg_write(h->bridge, 0x6C, h->or6c);
+		if (ret)
+			pr_warn("failed to restore AMD bridge register 0x6c: %d\n", ret);
 	} else if (v == IT87_H2_VENDOR_INTEL) {
 		/* Mirror hidden first, then PCI config */
-		if (h->hidden_ready && h->hidden_base) {
-			void __iomem *hb = ioremap(h->hidden_base, 0x200);
+		if (h->hidden_saved && h->hidden_base) {
+			hb = ioremap(h->hidden_base, 0x200);
 			if (hb) {
 				writel(h->hidden_orig_0x40, hb + 0x40);
 				writel(h->hidden_orig_0x44, hb + 0x44);
+				/* Flush posted writes before the mapping is dropped. */
+				(void)readl(hb + 0x44);
 				iounmap(hb);
+			} else {
+				pr_warn("unable to map Intel hidden bridge window while restoring state\n");
 			}
 		}
-		pci_reg_write(h->bridge, 0xD8, h->ord8);
-		pci_reg_write(h->bridge, 0x98, h->or98);
-		h->current_base = 0;
+		ret = pci_reg_write(h->bridge, 0xD8, h->ord8);
+		if (ret)
+			pr_warn("failed to restore Intel bridge register 0xd8: %d\n", ret);
+		ret = pci_reg_write(h->bridge, 0x98, h->or98);
+		if (ret)
+			pr_warn("failed to restore Intel bridge register 0x98: %d\n", ret);
 	}
+
+	/* Never trust the cached slot after a restore or rollback. */
+	h->current_base = 0;
 }
 
 /* ----- discrete per-slot programming ----- */
@@ -1561,26 +1683,32 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  *               0x6C=(0xFFFF0000 | END)
  *               0x48: set bit5
  */
- static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
- {
-	 int ret;
+static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
+{
+	int ret;
 
-	 if (!h || !h->bridge) return -ENODEV;
-	 if (idx < 0 || idx > 1) return -EINVAL;
-	 if (!h->have[idx]) return -EINVAL;
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx > 1 || !h->have[idx])
+		return -EINVAL;
 
-	 ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
-	 if (ret) return ret;
+	ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
+	if (ret)
+		goto rollback;
+	ret = pci_reg_write(h->bridge, 0x6C, h->r6c[idx]);
+	if (ret)
+		goto rollback;
+	ret = pci_reg_write(h->bridge, 0x48, h->r48[idx]);
+	if (ret)
+		goto rollback;
 
-	 ret = pci_reg_write(h->bridge, 0x6C, h->r6c[idx]);
-	 if (ret) return ret;
+	h->current_base = h->base[idx];
+	return 0;
 
-	 ret = pci_reg_write(h->bridge, 0x48, h->r48[idx]);
-	 if (ret) return ret;
-
-	 h->current_base = h->base[idx];
-	 return 0;
- }
+rollback:
+	_restore_regs(h);
+	return ret;
+}
 
 /* Intel:
  *  0x98: (START<<16)|1 with START=(base>>16)
@@ -1588,36 +1716,47 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  *        - slot0: clear bit0
  *        - slot1: clear one bit chosen from address tables
  */
- static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
+static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
+	void __iomem *hb;
 	int ret;
 
-	if (!h || !h->bridge) return -ENODEV;
-	if (idx < 0 || idx > 1) return -EINVAL;
-	if (!h->have[idx]) return -EINVAL;
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx > 1 || !h->have[idx])
+		return -EINVAL;
 
 	if (h->current_base == h->base[idx])
 		return 0; /* already active */
 
 	/* Hidden-window mirror first if available */
 	if (h->hidden_ready) {
-		void __iomem *hb = ioremap(h->hidden_base, 0x200);
-		if (hb) {
-			writel(h->r98[idx], hb + 0x40);
-			writel(h->rd8[idx], hb + 0x44);
-			iounmap(hb);
-		}
+		hb = ioremap(h->hidden_base, 0x200);
+		if (!hb)
+			return -ENOMEM;
+
+		writel(h->r98[idx], hb + 0x40);
+		writel(h->rd8[idx], hb + 0x44);
+		/* Flush posted writes before programming the PCI mirror. */
+		(void)readl(hb + 0x44);
+		iounmap(hb);
 	}
 
 	/* Then program PCI config */
 	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
-	if (ret) return ret;
+	if (ret)
+		goto rollback;
 
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
-	if (ret) return ret;
+	if (ret)
+		goto rollback;
 
 	h->current_base = h->base[idx];
 	return 0;
+
+rollback:
+	_restore_regs(h);
+	return ret;
 }
 
 static int _enable_slot(struct it87_h2ram_handle *h, int idx)
@@ -1645,13 +1784,14 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 	pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
 	while (pdev) {
 		if (pdev->vendor == IT87_H2_VENDOR_AMD || pdev->vendor == IT87_H2_VENDOR_INTEL) {
-			int ret;
+			int ret, save_ret;
 
 			h->bridge = pdev;
 			pci_dev_get(h->bridge);
 			ret = pci_enable_device(h->bridge);
 			pci_dev_put(pdev);
 			if (ret) {
+				pci_dev_put(h->bridge);
 				h->bridge = NULL;
 				return ret;
 			}
@@ -1671,7 +1811,15 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 					h->hidden_base = 0;
 				}
 			}
-			_save_regs(h);
+
+			save_ret = _save_regs(h);
+			if (save_ret) {
+				pci_disable_device(h->bridge);
+				pci_dev_put(h->bridge);
+				h->bridge = NULL;
+				return save_ret;
+			}
+
 			return 0;
 		}
 		pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), pdev);
@@ -1732,10 +1880,13 @@ static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 
 static void it87_h2_release(struct it87_h2ram_handle *h)
 {
-	if (!h || !h->bridge)return;
+	if (!h || !h->bridge)
+		return;
+
 	_restore_regs(h);
+	pci_disable_device(h->bridge);
 	pci_dev_put(h->bridge);
-	h->bridge = NULL;
+	memset(h, 0, sizeof(*h));
 }
 
 /* ----- Global, locked API for shared MMIO bridge ----- */
@@ -1756,10 +1907,14 @@ static int it87_h2_global_init(void)
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
-	if (!it87_h2_global_ready) {
-		return -ENODEV;
-	}
-	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready)
+		ret = -ENODEV;
+	else
+		ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+	mutex_unlock(&mmio_lock);
+
 	return ret;
 }
 
@@ -1774,15 +1929,24 @@ static int it87_h2_global_use_slot(int idx)
 	return ret;
 }
 
-/* Fully release: restore PCI config and drop PCI ref */
+/* Firmware/PCI resume may have changed the bridge behind our cache. */
+static void it87_h2_global_invalidate(void)
+{
+	mutex_lock(&mmio_lock);
+	if (it87_h2_global_ready)
+		it87_h2_global.current_base = 0;
+	mutex_unlock(&mmio_lock);
+}
+
+/* Fully release: restore PCI config, disable the bridge, and drop its ref. */
 static void it87_h2_global_release(void)
 {
 	mutex_lock(&mmio_lock);
-	if (it87_h2_global_ready) {
+	if (it87_h2_global.bridge)
 		it87_h2_release(&it87_h2_global);
-		it87_h2_global_ready  = false;
-		it87_h2_global_inited = false;
-	}
+
+	it87_h2_global_ready  = false;
+	it87_h2_global_inited = false;
 	mutex_unlock(&mmio_lock);
 }
 
@@ -2298,16 +2462,16 @@ static int it87_bridge_read(struct it87_data *data, u16 reg)
 {
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		it87_h2_global_ready &&
 		(data->mmio_bridge || data->mmio_h2ram)) {
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 		int val = 0;
 
 		mutex_lock(&mmio_lock);
 
-		if (!it87_h2_global_use_slot(slot)) {
+		if (it87_h2_global_ready &&
+		    !it87_h2_global_use_slot(slot))
 			val = it87_mmio_read(data, reg);
-		}
+
 		mutex_unlock(&mmio_lock);
 		return val;
 	}
@@ -2318,17 +2482,15 @@ static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 {
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		it87_h2_global_ready &&
 		(data->mmio_bridge || data->mmio_h2ram)) {
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 
 		mutex_lock(&mmio_lock);
 
-		if (it87_h2_global_use_slot(slot)) {
-			mutex_unlock(&mmio_lock);
-			return;
-		}
-		it87_mmio_write(data, reg, value);
+		if (it87_h2_global_ready &&
+		    !it87_h2_global_use_slot(slot))
+			it87_mmio_write(data, reg, value);
+
 		mutex_unlock(&mmio_lock);
 	}
 }
@@ -2382,9 +2544,466 @@ static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 	_it87_io_write(data, reg, value);
 }
 
+static int it87_h2ram_channel_count(const struct it87_data *data)
+{
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+		return IT87_H2RAM_BASE_FANS + data->it57xx_fans;
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2)
+		return IT87_H2RAM_BASE_FANS;
+	return 0;
+}
+
+static bool it87_is_it57xx_channel(const struct it87_data *data, int nr)
+{
+	return data->h2ram_sf_gen == IT87_H2RAM_SF_G3 &&
+	       nr >= IT87_H2RAM_BASE_FANS &&
+	       nr < IT87_H2RAM_BASE_FANS + data->it57xx_fans;
+}
+
+static bool it87_uses_h2ram_vectors(const struct it87_data *data, int nr)
+{
+	return nr >= 0 && nr < it87_h2ram_channel_count(data);
+}
+
+static bool it87_needs_extra_vector_disable(const struct it87_data *data)
+{
+	return data->type == it8689 ||
+	       (data->type == it8688 && data->revision >= 0x02);
+}
+
+static u16 it87_h2ram_vector_base(const struct it87_data *data, int nr)
+{
+	if (it87_is_it57xx_channel(data, nr))
+		return IT87_IT57XX_VECTOR[nr - IT87_H2RAM_BASE_FANS];
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2)
+		return IT87_H2RAM_G2_VECTOR[nr];
+
+	return IT87_H2RAM_G3_VECTOR[nr];
+}
+
+static bool it87_h2ram_tach_regs(const struct it87_data *data, int nr,
+				 u16 *lsb, u16 *msb)
+{
+	int ext;
+
+	if (data->h2ram_sf_gen != IT87_H2RAM_SF_G3)
+		return false;
+
+	if (nr < IT87_H2RAM_BASE_FANS) {
+		*lsb = IT87_H2RAM_G3_TACH_LSB[nr];
+		*msb = IT87_H2RAM_G3_TACH_MSB[nr];
+		return true;
+	}
+
+	if (!it87_is_it57xx_channel(data, nr))
+		return false;
+
+	ext = nr - IT87_H2RAM_BASE_FANS;
+	if (data->it57xx_version == 1) {
+		*lsb = IT87_IT57XX_V1_TACH_LSB[ext];
+		*msb = IT87_IT57XX_V1_TACH_MSB[ext];
+	} else {
+		*lsb = IT87_IT57XX_V2_TACH_LSB[ext];
+		*msb = IT87_IT57XX_V2_TACH_MSB[ext];
+	}
+
+	return true;
+}
+
+static bool it87_h2ram_tach_channel(const struct it87_data *data, int nr)
+{
+	u16 lsb, msb;
+
+	return it87_h2ram_tach_regs(data, nr, &lsb, &msb);
+}
+
+static void it87_h2ram_set_smartfan(struct it87_data *data, bool enable)
+{
+	u8 val = enable ? 0x01 : 0x00;
+	int cur = data->read(data, IT87_SMARTFAN_ENABLE);
+
+	if (cur >= 0 && (u8)cur == val)
+		return;
+
+	data->write(data, IT87_SMARTFAN_ENABLE, val);
+}
+
+static u8 it87_h2ram_override_mask(const struct it87_data *data)
+{
+	int channels;
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
+		return data->pwm_override_mask & GENMASK(IT87_H2RAM_BASE_FANS - 1, 0);
+
+	channels = it87_h2ram_channel_count(data);
+	if (!channels)
+		return 0;
+
+	return data->pwm_override_mask & (BIT(channels) - 1);
+}
+
+/* Save the shared SmartFan byte only when software first takes ownership. */
+static void it87_h2ram_take_control(struct it87_data *data)
+{
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
+		return;
+
+	if (!data->h2ram_smartfan_orig_valid) {
+		data->h2ram_smartfan_orig =
+			data->read(data, IT87_SMARTFAN_ENABLE);
+		data->h2ram_smartfan_orig_valid = true;
+	}
+
+	/* G1 hands control to the conventional EC; G2/G3 keep SmartFan active. */
+	it87_h2ram_set_smartfan(data, data->h2ram_sf_gen != IT87_H2RAM_SF_G1);
+}
+
+static void it87_h2ram_restore_global_snapshot(struct it87_data *data,
+						bool release)
+{
+	if (!data->h2ram_smartfan_orig_valid)
+		return;
+
+	data->write(data, IT87_SMARTFAN_ENABLE, data->h2ram_smartfan_orig);
+	if (release)
+		data->h2ram_smartfan_orig_valid = false;
+}
+
+static void it87_h2ram_release_control_if_idle(struct it87_data *data)
+{
+	if (!it87_h2ram_override_mask(data))
+		it87_h2ram_restore_global_snapshot(data, true);
+}
+
+static bool it87_uses_conventional_override(const struct it87_data *data,
+					     int nr)
+{
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
+		return nr >= 0 && nr < IT87_H2RAM_BASE_FANS;
+
+	return it87_needs_extra_vector_disable(data) &&
+	       nr >= 0 && nr < ARRAY_SIZE(IT87_REG_PWM);
+}
+
+static void it87_save_conventional_pwm(struct it87_data *data, int nr)
+{
+	u8 reg;
+
+	if (data->pwm_state_saved[nr])
+		return;
+
+	data->pwm_ctrl_saved[nr] = data->read(data, data->REG_PWM[nr]);
+	data->pwm_duty_saved[nr] = data->read(data, IT87_REG_PWM_DUTY[nr]);
+
+	if (nr < 3 && has_fanctl_onoff(data)) {
+		reg = data->read(data, IT87_REG_FAN_CTL);
+		data->fan_ctl_saved_bits &= ~BIT(nr);
+		data->fan_ctl_saved_bits |= reg & BIT(nr);
+
+		reg = data->read(data, IT87_REG_FAN_MAIN_CTRL);
+		data->fan_main_ctrl_saved_bits &= ~BIT(nr);
+		data->fan_main_ctrl_saved_bits |= reg & BIT(nr);
+		data->fan_shared_saved_mask |= BIT(nr);
+	}
+
+	data->pwm_state_saved[nr] = true;
+}
+
+static void it87_restore_conventional_pwm(struct it87_data *data, int nr,
+						   bool release)
+{
+	u8 reg;
+
+	if (!data->pwm_state_saved[nr])
+		return;
+
+	/* Restore Start PWM before restoring the automatic-mode control byte. */
+	data->write(data, IT87_REG_PWM_DUTY[nr], data->pwm_duty_saved[nr]);
+	data->write(data, data->REG_PWM[nr], data->pwm_ctrl_saved[nr]);
+
+	if (nr < 3 && (data->fan_shared_saved_mask & BIT(nr))) {
+		reg = data->read(data, IT87_REG_FAN_CTL);
+		reg &= ~BIT(nr);
+		reg |= data->fan_ctl_saved_bits & BIT(nr);
+		data->write(data, IT87_REG_FAN_CTL, reg);
+		if (release)
+			data->fan_ctl = reg;
+
+		reg = data->read(data, IT87_REG_FAN_MAIN_CTRL);
+		reg &= ~BIT(nr);
+		reg |= data->fan_main_ctrl_saved_bits & BIT(nr);
+		data->write(data, IT87_REG_FAN_MAIN_CTRL, reg);
+		if (release)
+			data->fan_main_ctrl = reg;
+	}
+
+	if (release) {
+		data->pwm_ctrl[nr] = data->pwm_ctrl_saved[nr];
+		data->pwm_duty[nr] = data->pwm_duty_saved[nr];
+		data->pwm_state_saved[nr] = false;
+		data->fan_shared_saved_mask &= ~BIT(nr);
+	}
+}
+
+static void it87_apply_conventional_override(struct it87_data *data, int nr,
+						      u8 mode, u8 pwm)
+{
+	u8 ctrl;
+	u8 reg;
+
+	if (mode == 0 && nr < 3 && has_fanctl_onoff(data)) {
+		reg = data->read(data, IT87_REG_FAN_CTL) | BIT(nr);
+		data->write(data, IT87_REG_FAN_CTL, reg);
+		data->fan_ctl = reg;
+
+		reg = data->read(data, IT87_REG_FAN_MAIN_CTRL) & ~BIT(nr);
+		data->write(data, IT87_REG_FAN_MAIN_CTRL, reg);
+		data->fan_main_ctrl = reg;
+		return;
+	}
+
+	if (mode == 0)
+		pwm = pwm_to_reg(data, 0xff);
+
+	data->write(data, IT87_REG_PWM_DUTY[nr], pwm);
+	data->pwm_duty[nr] = pwm;
+
+	if (has_newer_autopwm(data))
+		ctrl = data->pwm_ctrl_saved[nr] & 0x7f;
+	else
+		ctrl = pwm;
+
+	data->write(data, data->REG_PWM[nr], ctrl);
+	data->pwm_ctrl[nr] = ctrl;
+
+	if (nr < 3 && has_fanctl_onoff(data)) {
+		reg = data->read(data, IT87_REG_FAN_MAIN_CTRL) | BIT(nr);
+		data->write(data, IT87_REG_FAN_MAIN_CTRL, reg);
+		data->fan_main_ctrl = reg;
+	}
+}
+
+static void it87_h2ram_save_vector(struct it87_data *data, int nr)
+{
+	u16 base;
+	int i;
+
+	if (data->h2ram_vector_saved[nr])
+		return;
+
+	base = it87_h2ram_vector_base(data, nr);
+
+	data->h2ram_primary_saved[nr][0] = data->read(data, base + 2);
+	data->h2ram_primary_saved[nr][1] = data->read(data, base + 3);
+	data->h2ram_primary_saved[nr][2] = data->read(data, base + 4);
+	data->h2ram_primary_saved[nr][3] = data->read(data, base + 5);
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
+		data->h2ram_primary_saved[nr][4] = 0;
+		for (i = 0; i < 3; i++)
+			data->h2ram_extra_start_saved[nr][i] =
+				data->read(data, base + 6 + i * 2);
+	} else {
+		data->h2ram_primary_saved[nr][4] = data->read(data, base + 6);
+		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
+			data->h2ram_extra_start_saved[nr][i] =
+				data->read(data, base + 7 + i * 4);
+	}
+
+	data->h2ram_vector_saved[nr] = true;
+}
+
+static void it87_h2ram_set_manual(struct it87_data *data, int nr, u8 pwm)
+{
+	u16 base = it87_h2ram_vector_base(data, nr);
+	int i;
+
+	it87_h2ram_save_vector(data, nr);
+
+	/* G2/G3 direct manual control is performed with SmartFan left on. */
+	it87_h2ram_set_smartfan(data, true);
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
+		/* Move the three extra vectors out of the usable temperature range. */
+		for (i = 0; i < 3; i++)
+			data->write(data, base + 6 + i * 2, 0x7f);
+
+		data->write(data, base + 2, 0x00); /* fan start temp */
+		data->write(data, base + 3, 0x7f); /* full-speed temp */
+		data->write(data, base + 4, pwm);  /* direct duty */
+		data->write(data, base + 5, 0x00); /* primary slope */
+	} else {
+		/* G3 explicitly disables an extra vector when Start Temp == 0x64. */
+		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
+			data->write(data, base + 7 + i * 4, 0x64);
+
+		data->write(data, base + 2, 0x00); /* fan start temp */
+		data->write(data, base + 3, 0x7f); /* full-speed temp */
+		data->write(data, base + 4, pwm);  /* direct duty */
+		data->write(data, base + 5, 0x00); /* slope LSB */
+		data->write(data, base + 6, 0x00); /* slope MSB */
+	}
+
+	data->pwm_duty[nr] = pwm;
+}
+
+static void it87_h2ram_restore_vector(struct it87_data *data, int nr,
+					       bool release)
+{
+	u16 base;
+	int i;
+
+	if (!data->h2ram_vector_saved[nr])
+		return;
+
+	base = it87_h2ram_vector_base(data, nr);
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
+		for (i = 0; i < 3; i++)
+			data->write(data, base + 6 + i * 2,
+				    data->h2ram_extra_start_saved[nr][i]);
+	} else {
+		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
+			data->write(data, base + 7 + i * 4,
+				    data->h2ram_extra_start_saved[nr][i]);
+		data->write(data, base + 6, data->h2ram_primary_saved[nr][4]);
+	}
+
+	data->write(data, base + 5, data->h2ram_primary_saved[nr][3]);
+	data->write(data, base + 4, data->h2ram_primary_saved[nr][2]);
+	data->write(data, base + 3, data->h2ram_primary_saved[nr][1]);
+	data->write(data, base + 2, data->h2ram_primary_saved[nr][0]);
+
+	if (release)
+		data->h2ram_vector_saved[nr] = false;
+}
+
+static void it87_disable_extra_vectors(struct it87_data *data, int nr)
+{
+	u16 reg;
+	int i;
+
+	if (!it87_needs_extra_vector_disable(data))
+		return;
+
+	if (!data->extvec_enable_saved[nr]) {
+		for (i = 0; i < 3; i++)
+			data->extvec_saved[nr][i] = data->read(data,
+					IT87_EXTVEC_B2_ENABLE(nr, i));
+		data->extvec_saved[nr][3] =
+			data->read(data, IT87_EXTVEC_B3_ENABLE(nr));
+		data->extvec_enable_saved[nr] = true;
+	}
+
+	for (i = 0; i < 3; i++) {
+		reg = IT87_EXTVEC_B2_ENABLE(nr, i);
+		data->write(data, reg, data->read(data, reg) & ~BIT(7));
+	}
+
+	reg = IT87_EXTVEC_B3_ENABLE(nr);
+	data->write(data, reg, data->read(data, reg) & ~GENMASK(5, 0));
+}
+
+static void it87_restore_extra_vectors(struct it87_data *data, int nr,
+						bool release)
+{
+	int i;
+
+	if (!data->extvec_enable_saved[nr])
+		return;
+
+	for (i = 0; i < 3; i++)
+		data->write(data, IT87_EXTVEC_B2_ENABLE(nr, i),
+			    data->extvec_saved[nr][i]);
+	data->write(data, IT87_EXTVEC_B3_ENABLE(nr),
+		    data->extvec_saved[nr][3]);
+	if (release)
+		data->extvec_enable_saved[nr] = false;
+}
+
+/* Put active software-owned channels back on their exact firmware snapshots. */
+static void it87_restore_overrides_to_firmware(struct it87_data *data)
+{
+	u8 mask = data->pwm_override_mask;
+	int i;
+
+	for (i = 0; i < NUM_PWM; i++) {
+		if (!(mask & BIT(i)))
+			continue;
+
+		if (it87_uses_h2ram_vectors(data, i)) {
+			it87_h2ram_restore_vector(data, i, false);
+		} else if (it87_uses_conventional_override(data, i)) {
+			it87_restore_conventional_pwm(data, i, false);
+			it87_restore_extra_vectors(data, i, false);
+		}
+	}
+
+	/* Shared ownership is relinquished only after every channel is restored. */
+	it87_h2ram_restore_global_snapshot(data, false);
+}
+
+/* Re-assert the exact software override after a successful system resume. */
+static void it87_reapply_overrides(struct it87_data *data)
+{
+	u8 mask = data->pwm_override_mask;
+	int i;
+
+	if (!mask)
+		return;
+
+	/* G2/G3 must have SmartFan active while their flattened vectors are used. */
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2 ||
+	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+		it87_h2ram_take_control(data);
+
+	for (i = 0; i < NUM_PWM; i++) {
+		if (!(mask & BIT(i)))
+			continue;
+
+		if (it87_uses_h2ram_vectors(data, i)) {
+			it87_h2ram_set_manual(data, i, data->pwm_override_duty[i]);
+			data->h2ram_pwm_mode[i] = data->pwm_override_mode[i];
+		} else if (it87_uses_conventional_override(data, i)) {
+			it87_apply_conventional_override(data, i,
+						 data->pwm_override_mode[i],
+						 data->pwm_override_duty[i]);
+			it87_disable_extra_vectors(data, i);
+		}
+	}
+
+	/* G1 changes ownership only after its conventional EC state is ready. */
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1 &&
+	    it87_h2ram_override_mask(data))
+		it87_h2ram_take_control(data);
+}
+
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
 {
 	u8 ctrl;
+
+	if (it87_uses_h2ram_vectors(data, nr)) {
+		/*
+		 * While software owns a G2/G3/IT57xx channel, the authoritative
+		 * manual duty is the Start PWM byte in the flattened vector.
+		 *
+		 * Base G2/G3 channels also have live PWM feedback in automatic
+		 * mode. IT57xx extension channels do not have a live PWM
+		 * readback register, so leave pwm_duty untouched there; show_pwm()
+		 * reports -ENODATA while the channel is firmware-controlled.
+		 *
+		 * Read the value back from hardware rather than merely returning
+		 * the cached requested duty.
+		 */
+		if (data->pwm_override_mask & BIT(nr))
+			data->pwm_duty[nr] =
+				data->read(data, it87_h2ram_vector_base(data, nr) + 4);
+		else if (!it87_is_it57xx_channel(data, nr))
+			data->pwm_duty[nr] =
+				data->read(data, IT87_H2RAM_G23_PWM[nr]);
+		return;
+	}
 
 	ctrl = data->read(data, data->REG_PWM[nr]);
 	data->pwm_ctrl[nr] = ctrl;
@@ -2454,6 +3073,7 @@ static struct it87_data *it87_update_device(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
 	struct it87_data *ret = data;
+	u16 tach_lsb, tach_msb;
 	int err;
 	int i;
 
@@ -2492,6 +3112,18 @@ static struct it87_data *it87_update_device(struct device *dev)
 			/* Skip disabled fans */
 			if (!(data->has_fan & BIT(i)))
 				continue;
+
+			/*
+			 * IT879x G3 and IT57xx tachometers live in H2RAM.  Handle
+			 * them before the legacy register arrays; fan7 has no legacy
+			 * EC register slot at all.
+			 */
+			if (it87_h2ram_tach_regs(data, i, &tach_lsb, &tach_msb)) {
+				data->fan[i][0] = data->read(data, tach_lsb);
+				data->fan[i][0] |= data->read(data, tach_msb) << 8;
+				data->fan[i][1] = 0;
+				continue;
+			}
 
 			data->fan[i][1] = data->read(data,
 					data->REG_FAN_MIN[i]);
@@ -2927,6 +3559,9 @@ static SENSOR_DEVICE_ATTR(temp6_type, S_IRUGO | S_IWUSR, show_temp_type,
 
 static int pwm_mode(const struct it87_data *data, int nr)
 {
+	if (it87_uses_h2ram_vectors(data, nr))
+		return data->h2ram_pwm_mode[nr];
+
 	if (has_fanctl_onoff(data) && nr < 3 &&
 	    !(data->fan_main_ctrl & BIT(nr)))
 		return 0;			/* Full speed */
@@ -2951,10 +3586,17 @@ static ssize_t show_fan(struct device *dev, struct device_attribute *attr,
 	if (IS_ERR(data))
 		return PTR_ERR(data);
 
-	speed = has_16bit_fans(data) ?
-		FAN16_FROM_REG(data->fan[nr][index]) :
-		FAN_FROM_REG(data->fan[nr][index],
-			     DIV_FROM_REG(data->fan_div[nr]));
+	if (index == 0 && it87_h2ram_tach_channel(data, nr)) {
+		/* G3/IT57xx H2RAM stores the fan speed directly in RPM. */
+		speed = data->fan[nr][0];
+		if (speed == 0xffff)
+			speed = 0;
+	} else {
+		speed = has_16bit_fans(data) ?
+			FAN16_FROM_REG(data->fan[nr][index]) :
+			FAN_FROM_REG(data->fan[nr][index],
+				     DIV_FROM_REG(data->fan_div[nr]));
+	}
 	return sprintf(buf, "%d\n", speed);
 }
 
@@ -2993,6 +3635,15 @@ static ssize_t show_pwm(struct device *dev, struct device_attribute *attr,
 
 	if (IS_ERR(data))
 		return PTR_ERR(data);
+
+	/*
+	 * IT57xx has no live PWM feedback register. The programmed Start PWM
+	 * byte is authoritative only while software owns the flattened vector;
+	 * in firmware/automatic mode the instantaneous duty is unavailable.
+	 */
+	if (it87_is_it57xx_channel(data, nr) &&
+	    !(data->pwm_override_mask & BIT(nr)))
+		return -ENODATA;
 
 	return sprintf(buf, "%d\n",
 		       pwm_from_reg(data, data->pwm_duty[nr]));
@@ -3146,45 +3797,6 @@ static int check_trip_points(struct device *dev, int nr)
 	return err;
 }
 
-/* SmartFan global control in H2RAM:
- *   0x00 = manual / non-automatic (any channel non-auto)
- *   0x01 = automatic (all channels automatic)
- *
- * Only call this when data->mmio_h2ram or data->ecio_h2ram is true.
- * For newer H2RAM based controllers with separate SmartFan toggle'
- */
-static void it87_update_smartfan_bit(struct it87_data *data, bool enable)
-{
-	u8 	val;
-	int cur;
-
-	val = enable ? 0x01 : 0x00;
-	cur = data->read(data,IT87_SMARTFAN_ENABLE);
-	if (cur >= 0 && (u8)cur == val)
-	return;
-	/* 0x947 is the SmartFan global control byte in H2RAM */
-	data->write(data, IT87_SMARTFAN_ENABLE, val);
-}
-
-static void it87_update_smartfan_global(struct it87_data *data)
-{
-	bool all_auto = true;
-	int  i;
-
-	for (i=0; i<NUM_AUTO_PWM; i++) {
-		/* Skip PWM channels that are not actually used/enabled */
-		if (!(data->has_pwm & BIT(i)))
-			continue;
-
-		/* pwm_mode(): 0 = full, 1 = manual, 2 = automatic */
-		if (pwm_mode(data, i) != 2) {
-			all_auto = false;
-			break;
-		}
-	}
-	it87_update_smartfan_bit(data, all_auto);
-}
-
 static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
@@ -3193,13 +3805,16 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 	int nr = sensor_attr->index;
 	long val;
 	int err;
+	u8 pwm;
 
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 2)
 		return -EINVAL;
 
-	/* Check trip points before switching to automatic mode */
+	/* Snapshot-backed controllers restore firmware state instead of rebuilding it. */
 	if (val == 2) {
-		if (check_trip_points(dev, nr) < 0)
+		if (!it87_uses_h2ram_vectors(data, nr) &&
+		    !it87_uses_conventional_override(data, nr) &&
+		    check_trip_points(dev, nr) < 0)
 			return -EINVAL;
 	}
 
@@ -3208,6 +3823,52 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		return err;
 
 	it87_update_pwm_ctrl(data, nr);
+
+	if (it87_uses_h2ram_vectors(data, nr)) {
+		if (val == 2) {
+			it87_h2ram_restore_vector(data, nr, true);
+			data->h2ram_pwm_mode[nr] = 2;
+			data->pwm_override_mask &= ~BIT(nr);
+			it87_h2ram_release_control_if_idle(data);
+		} else {
+			pwm = val == 0 ? pwm_to_reg(data, 0xff) : data->pwm_duty[nr];
+			data->pwm_override_mask |= BIT(nr);
+			data->pwm_override_mode[nr] = val;
+			data->pwm_override_duty[nr] = pwm;
+			it87_h2ram_take_control(data);
+			it87_h2ram_set_manual(data, nr, pwm);
+			data->h2ram_pwm_mode[nr] = val;
+		}
+		it87_unlock(data);
+		return count;
+	}
+
+	if (it87_uses_conventional_override(data, nr)) {
+		if (val == 2) {
+			it87_restore_conventional_pwm(data, nr, true);
+			/* Extra vectors are enabled only after the primary state is safe. */
+			it87_restore_extra_vectors(data, nr, true);
+			data->pwm_override_mask &= ~BIT(nr);
+			if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
+				it87_h2ram_release_control_if_idle(data);
+		} else {
+			it87_save_conventional_pwm(data, nr);
+			it87_disable_extra_vectors(data, nr);
+
+			pwm = val == 0 ? pwm_to_reg(data, 0xff) : data->pwm_duty[nr];
+			data->pwm_override_mask |= BIT(nr);
+			data->pwm_override_mode[nr] = val;
+			data->pwm_override_duty[nr] = pwm;
+			it87_apply_conventional_override(data, nr, val, pwm);
+
+			/* G1 changes 0x947 only after its EC override is programmed. */
+			if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
+				it87_h2ram_take_control(data);
+		}
+
+		it87_unlock(data);
+		return count;
+	}
 
 	if (val == 0) {
 		if (nr < 3 && has_fanctl_onoff(data)) {
@@ -3261,11 +3922,6 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		}
 	}
 
-	 /* If this device uses H2RAM/ECIO SmartFan, sync the global bit at 0x947 */
-	if (data->mmio_h2ram || data->ecio_h2ram) {
-		it87_update_smartfan_global(data);
-	}
-
 	it87_unlock(data);
 	return count;
 }
@@ -3285,6 +3941,32 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 	err = it87_lock(data);
 	if (err)
 		return err;
+
+	if (it87_uses_h2ram_vectors(data, nr)) {
+		if (data->h2ram_pwm_mode[nr] != 1) {
+			count = -EBUSY;
+			goto unlock;
+		}
+
+		data->pwm_duty[nr] = pwm_to_reg(data, val);
+		data->write(data, it87_h2ram_vector_base(data, nr) + 4,
+			    data->pwm_duty[nr]);
+		data->pwm_override_duty[nr] = data->pwm_duty[nr];
+		goto unlock;
+	}
+
+	if (it87_uses_conventional_override(data, nr) &&
+	    (data->pwm_override_mask & BIT(nr))) {
+		if (data->pwm_override_mode[nr] != 1) {
+			count = -EBUSY;
+			goto unlock;
+		}
+
+		data->pwm_duty[nr] = pwm_to_reg(data, val);
+		data->write(data, IT87_REG_PWM_DUTY[nr], data->pwm_duty[nr]);
+		data->pwm_override_duty[nr] = data->pwm_duty[nr];
+		goto unlock;
+	}
 
 	it87_update_pwm_ctrl(data, nr);
 	if (has_newer_autopwm(data)) {
@@ -3572,6 +4254,9 @@ static SENSOR_DEVICE_ATTR_2(fan6_input, S_IRUGO, show_fan, NULL, 5, 0);
 static SENSOR_DEVICE_ATTR_2(fan6_min, S_IRUGO | S_IWUSR, show_fan, set_fan,
 			    5, 1);
 
+/* IT57xx v2 can extend the secondary controller to a seventh fan. */
+static SENSOR_DEVICE_ATTR_2(fan7_input, S_IRUGO, show_fan, NULL, 6, 0);
+
 static SENSOR_DEVICE_ATTR(pwm1_enable, S_IRUGO | S_IWUSR,
 			  show_pwm_enable, set_pwm_enable, 0);
 static SENSOR_DEVICE_ATTR(pwm1, S_IRUGO | S_IWUSR, show_pwm, set_pwm, 0);
@@ -3704,6 +4389,10 @@ static SENSOR_DEVICE_ATTR(pwm6, S_IRUGO | S_IWUSR, show_pwm, set_pwm, 5);
 static SENSOR_DEVICE_ATTR(pwm6_freq, S_IRUGO, show_pwm_freq, NULL, 5);
 static SENSOR_DEVICE_ATTR(pwm6_auto_channels_temp, S_IRUGO,
 			  show_pwm_temp_map, set_pwm_temp_map, 5);
+
+static SENSOR_DEVICE_ATTR(pwm7_enable, S_IRUGO | S_IWUSR,
+			  show_pwm_enable, set_pwm_enable, 6);
+static SENSOR_DEVICE_ATTR(pwm7, S_IRUGO | S_IWUSR, show_pwm, set_pwm, 6);
 static SENSOR_DEVICE_ATTR_2(pwm6_auto_point1_temp, S_IRUGO | S_IWUSR,
 			    show_auto_temp, set_auto_temp, 2, 1);
 static SENSOR_DEVICE_ATTR_2(pwm6_auto_point1_temp_hyst, S_IRUGO | S_IWUSR,
@@ -3918,6 +4607,101 @@ static SENSOR_DEVICE_ATTR(in7_label, S_IRUGO, show_label, NULL, 1);
 static SENSOR_DEVICE_ATTR(in8_label, S_IRUGO, show_label, NULL, 2);
 /* AVCC3 */
 static SENSOR_DEVICE_ATTR(in9_label, S_IRUGO, show_label, NULL, 3);
+
+static ssize_t gigabyte_siv_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (!gigabyte_siv_valid)
+		return sprintf(buf, "unavailable\n");
+
+	return sprintf(buf, "%08X\n", gigabyte_siv);
+}
+
+static ssize_t gigabyte_lid_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (!gigabyte_lid_valid)
+		return sprintf(buf, "unavailable\n");
+
+	return sprintf(buf, "%08X\n", gigabyte_lid);
+}
+
+static DEVICE_ATTR_RO(gigabyte_siv);
+static DEVICE_ATTR_RO(gigabyte_lid);
+
+static struct attribute *gigabyte_id_attributes[] = {
+	&dev_attr_gigabyte_siv.attr,
+	&dev_attr_gigabyte_lid.attr,
+	NULL
+};
+
+static const struct attribute_group gigabyte_id_group = {
+	.attrs = gigabyte_id_attributes,
+};
+
+static int __init gigabyte_ids_init(void)
+{
+	int ret;
+
+	if (!dmi_check_system(gigabyte_dmi_table))
+		return 0;
+
+	gigabyte_siv_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_SIV_ID,
+						       &gigabyte_siv);
+	gigabyte_lid_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_LED_ID,
+						       &gigabyte_lid);
+
+	if (gigabyte_siv_valid)
+		pr_info("Gigabyte SIV ID = %08X\n", gigabyte_siv);
+	else
+		pr_warn("Failed to read Gigabyte SIV ID\n");
+
+	if (gigabyte_lid_valid)
+		pr_info("Gigabyte LID ID = %08X\n", gigabyte_lid);
+	else
+		pr_warn("Failed to read Gigabyte LID ID\n");
+
+	gigabyte_class = class_create("gigabyte");
+	if (IS_ERR(gigabyte_class)) {
+		ret = PTR_ERR(gigabyte_class);
+		gigabyte_class = NULL;
+		return ret;
+	}
+
+	gigabyte_dev = device_create(gigabyte_class, NULL, MKDEV(0, 0), NULL,
+				      "id");
+	if (IS_ERR(gigabyte_dev)) {
+		ret = PTR_ERR(gigabyte_dev);
+		gigabyte_dev = NULL;
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+		return ret;
+	}
+
+	ret = sysfs_create_group(&gigabyte_dev->kobj, &gigabyte_id_group);
+	if (ret) {
+		device_unregister(gigabyte_dev);
+		gigabyte_dev = NULL;
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+	}
+
+	return ret;
+}
+
+static void gigabyte_ids_exit(void)
+{
+	if (gigabyte_dev) {
+		sysfs_remove_group(&gigabyte_dev->kobj, &gigabyte_id_group);
+		device_unregister(gigabyte_dev);
+		gigabyte_dev = NULL;
+	}
+
+	if (gigabyte_class) {
+		class_destroy(gigabyte_class);
+		gigabyte_class = NULL;
+	}
+}
 
 static umode_t it87_in_is_visible(struct kobject *kobj,
 				  struct attribute *attr, int index)
@@ -4185,6 +4969,9 @@ static struct attribute *it87_attributes_fan[] = {
 	&sensor_dev_attr_fan6_min.dev_attr.attr,
 	&sensor_dev_attr_fan6_alarm.dev_attr.attr,
 	&sensor_dev_attr_fan6_beep.dev_attr.attr,
+
+	/* IT57xx extension: fan7 has input only in this barebones interface. */
+	&sensor_dev_attr_fan7_input.dev_attr.attr,
 	NULL
 };
 
@@ -4200,6 +4987,10 @@ static umode_t it87_pwm_is_visible(struct kobject *kobj,
 	struct it87_data *data = dev_get_drvdata(dev);
 	int i = index / 4;	/* pwm index */
 	int a = index % 4;	/* attribute index */
+
+	/* H2RAM G2/G3 currently exposes only enable + direct PWM duty. */
+	if (it87_uses_h2ram_vectors(data, i) && a >= 2)
+		return 0;
 
 	if (!(data->has_pwm & BIT(i)))
 		return 0;
@@ -4246,6 +5037,10 @@ static struct attribute *it87_attributes_pwm[] = {
 	&sensor_dev_attr_pwm6_freq.dev_attr.attr,
 	&sensor_dev_attr_pwm6_auto_channels_temp.dev_attr.attr,
 
+	/* IT57xx extension: no freq or vector attributes are exported. */
+	&sensor_dev_attr_pwm7_enable.dev_attr.attr,
+	&sensor_dev_attr_pwm7.dev_attr.attr,
+
 	NULL
 };
 
@@ -4261,6 +5056,10 @@ static umode_t it87_auto_pwm_is_visible(struct kobject *kobj,
 	struct it87_data *data = dev_get_drvdata(dev);
 	int i = index / 11;	/* pwm index */
 	int a = index % 11;	/* attribute index */
+
+	/* H2RAM vector tables are intentionally not exposed through sysfs. */
+	if (data->h2ram_sf_gen != IT87_H2RAM_SF_NONE)
+		return 0;
 
 	if (index >= 33) {	/* pwm 4..6 */
 		i = (index - 33) / 6 + 3;
@@ -5225,6 +6024,125 @@ static void it87_init_regs(struct platform_device *pdev)
 	}
 }
 
+static void it87_detect_h2ram_smartfan(struct device *dev,
+				       struct it87_data *data)
+{
+	const char *h2ram_transport;
+	u8 g23_major, g23_minor;
+	u8 g1_major = 0, g1_minor = 0;
+	u8 it57_major = 0, it57_minor = 0;
+	u8 version_major, version_minor, smartfan;
+	bool siv_valid = false;
+	int i, channels;
+
+	if (!data->mmio_h2ram && !data->ecio_h2ram)
+		return;
+
+	if (data->type != it8790 && data->type != it8792 &&
+	    data->type != it87952)
+		return;
+
+	g23_major = data->read(data, IT87_H2RAM_G23_MAJOR);
+	g23_minor = data->read(data, IT87_H2RAM_G23_MINOR);
+
+	if (g23_major == 0x01 && g23_minor == 0x00 &&
+	    (data->type == it8792 || data->type == it87952)) {
+		data->h2ram_sf_gen = IT87_H2RAM_SF_G3;
+	} else if (g23_major == 0x00 &&
+		   (g23_minor == 0x01 || g23_minor == 0x03 ||
+		    g23_minor == 0x04) && data->type == it8792) {
+		data->h2ram_sf_gen = IT87_H2RAM_SF_G2;
+	} else {
+		g1_major = data->read(data, IT87_H2RAM_G1_MAJOR);
+		g1_minor = data->read(data, IT87_H2RAM_G1_MINOR);
+		if (g1_major && g1_minor &&
+		    (data->type == it8790 || data->type == it8792))
+			data->h2ram_sf_gen = IT87_H2RAM_SF_G1;
+	}
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
+		return;
+
+	/*
+	 * IT57xx is only valid as an extension of IT879x G3.  Require both
+	 * the extension version signature and Gigabyte SIV fan_count > 8.
+	 * There is no separate IT57xx SmartFan enable byte: 0x947 controls
+	 * the complete G3 controller, including all IT57xx channels.
+	 */
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 &&
+	    !gbw_siv_fan_count(&data->siv_fan_count)) {
+		siv_valid = true;
+		if (data->siv_fan_count > 8) {
+			it57_major = data->read(data, IT87_IT57XX_MAJOR);
+			it57_minor = data->read(data, IT87_IT57XX_MINOR);
+
+			if (it57_minor == 0x00 && it57_major == 0x01) {
+				data->it57xx_version = 1;
+				data->it57xx_fans = 2;
+			} else if (it57_minor == 0x00 && it57_major == 0x02) {
+				data->it57xx_version = 2;
+				data->it57xx_fans = data->ecio_h2ram ? 2 : 4;
+			}
+		}
+	}
+
+	smartfan = data->read(data, IT87_SMARTFAN_ENABLE);
+
+	channels = it87_h2ram_channel_count(data);
+	if (channels) {
+		for (i = 0; i < channels; i++)
+			data->h2ram_pwm_mode[i] = (smartfan & 0x01) ? 2 : 1;
+	}
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1) {
+		version_major = g1_major;
+		version_minor = g1_minor;
+	} else {
+		version_major = g23_major;
+		version_minor = g23_minor;
+	}
+
+	/*
+	 * Both H2RAM hybrid backends use conventional EC I/O below 0x800.
+	 * Only the high H2RAM range differs: MMIO bridge vs extended ECIO.
+	 */
+	h2ram_transport = data->ecio_h2ram ? "ECIO" : "MMIO";
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 && siv_valid)
+		dev_info(dev,
+			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d, SIV fan count=%u\n",
+			 it87_devices[data->type].name, data->revision,
+			 data->h2ram_sf_gen, version_major, version_minor,
+			 h2ram_transport, smartfan, channels,
+			 data->siv_fan_count);
+	else if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+		dev_info(dev,
+			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d, SIV fan count=unavailable\n",
+			 it87_devices[data->type].name, data->revision,
+			 data->h2ram_sf_gen, version_major, version_minor,
+			 h2ram_transport, smartfan, channels);
+	else
+		dev_info(dev,
+			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d\n",
+			 it87_devices[data->type].name, data->revision,
+			 data->h2ram_sf_gen, version_major, version_minor,
+			 h2ram_transport, smartfan, channels);
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 && siv_valid &&
+	    data->siv_fan_count > 8) {
+		if (data->it57xx_fans)
+			dev_info(dev,
+				 "IT57xx extension: v%02x.%02x, %u usable channels%s\n",
+				 it57_major, it57_minor, data->it57xx_fans,
+				 data->ecio_h2ram && data->it57xx_version == 2 ?
+				 " (ECIO limit)" : "");
+		else
+			dev_info(dev,
+				 "IT57xx extension: unrecognized v%02x.%02x (SIV fan count %u)\n",
+				 it57_major, it57_minor, data->siv_fan_count);
+	}
+}
+
 /*
  * Some chips seem to have default value 0xff for all limit
  * registers. For low voltage limits it makes no sense and triggers
@@ -5417,6 +6335,10 @@ static void it87_init_device(struct platform_device *pdev)
 static int it87_check_pwm(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
+
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2 ||
+	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+		return 1;
 	/*
 	 * Some BIOSes fail to correctly configure the IT87 fans. All fans off
 	 * and polarity set to active low is sign that this is the case so we
@@ -5528,6 +6450,7 @@ static int it87_probe(struct platform_device *pdev)
 	else
 		data->addr = 0;    /* no conventional EC I/O available */
 	data->type              = sio_data->type;
+	data->revision          = sio_data->revision;
 	data->sioaddr           = sio_data->sioaddr;
 	data->smbus_bitmap      = sio_data->smbus_bitmap;
 	data->ec_special_config = sio_data->ec_special_config;
@@ -5579,6 +6502,8 @@ static int it87_probe(struct platform_device *pdev)
 		smbus_enable(data);
 		return -ENODEV;
 	}
+
+	it87_detect_h2ram_smartfan(dev, data);
 
 	enable_pwm_interface = it87_check_pwm(dev);
 	if (!enable_pwm_interface)
@@ -5649,6 +6574,11 @@ static int it87_probe(struct platform_device *pdev)
 
 	it87_init_device(pdev);
 
+	/* IT57xx channels extend the IT879x G3 hwmon instance as fan4..fan7. */
+	if (data->it57xx_fans)
+		data->has_fan |= (BIT(data->it57xx_fans) - 1)
+				 << IT87_H2RAM_BASE_FANS;
+
 	smbus_enable(data);
 
 	if (!sio_data->skip_vid)
@@ -5668,8 +6598,15 @@ static int it87_probe(struct platform_device *pdev)
 		data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
 		data->has_pwm &= ~sio_data->skip_pwm;
 
+		/* IT57xx channels extend the same device as pwm4..pwm7. */
+		if (data->it57xx_fans)
+			data->has_pwm |= (BIT(data->it57xx_fans) - 1)
+					 << IT87_H2RAM_BASE_FANS;
+
 		data->groups[4] = &it87_group_pwm;
-		if (has_old_autopwm(data) || has_newer_autopwm(data))
+		/* H2RAM vectors are BIOS-owned in this barebones implementation. */
+		if ((has_old_autopwm(data) || has_newer_autopwm(data)) &&
+		    data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
 			data->groups[5] = &it87_group_auto_pwm;
 	}
 
@@ -5711,11 +6648,39 @@ static void it87_resume_sio(struct platform_device *pdev)
 	superio_exit(data->sioaddr, has_noconf(data));
 }
 
+static int it87_suspend(struct device *dev)
+{
+	struct it87_data *data = dev_get_drvdata(dev);
+	int err;
+
+	err = it87_lock(data);
+	if (err)
+		return err;
+
+	if (data->pwm_override_mask) {
+		/*
+		 * Hardware leaves suspend owned by firmware.  Keep all snapshots and
+		 * desired software values in memory so a successful resume can retake
+		 * control without changing what "automatic" means.
+		 */
+		it87_restore_overrides_to_firmware(data);
+		data->suspend_defaults_restored = true;
+		data->valid = false;
+	}
+
+	it87_unlock(data);
+	return 0;
+}
+
 static int it87_resume(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct it87_data *data = dev_get_drvdata(dev);
 	int err;
+	int pwm_safe;
+
+	if (data->mmio_bridge || data->mmio_h2ram)
+		it87_h2_global_invalidate();
 
 	it87_resume_sio(pdev);
 
@@ -5723,14 +6688,19 @@ static int it87_resume(struct device *dev)
 	if (err)
 		return err;
 
-	it87_check_pwm(dev);
+	pwm_safe = it87_check_pwm(dev);
 	it87_check_limit_regs(data);
 	it87_check_voltage_monitors_reset(data);
 	it87_check_tachometers_reset(pdev);
 	it87_check_tachometers_16bit_mode(pdev);
 
-	if (data->mmio_h2ram || data->ecio_h2ram) {
-		it87_update_smartfan_global(data);
+	/* Only a sane resume that reached this point retakes software ownership. */
+	if (data->suspend_defaults_restored && pwm_safe) {
+		it87_reapply_overrides(data);
+		data->suspend_defaults_restored = false;
+	} else if (data->suspend_defaults_restored) {
+		dev_warn(dev,
+			 "PWM sanity check failed after resume; leaving firmware fan curves active\n");
 	}
 
 	it87_start_monitoring(data);
@@ -5745,7 +6715,7 @@ static int it87_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, NULL, it87_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, it87_suspend, it87_resume);
 
 static struct platform_driver it87_driver = {
 	.driver = {
@@ -6044,10 +7014,15 @@ static int __init sm_it87_init(void)
 	int                 i, err;
 
 	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
-
-	err = platform_driver_register(&it87_driver);
+	err = gigabyte_ids_init();
 	if (err)
 		return err;
+
+	err = platform_driver_register(&it87_driver);
+	if (err) {
+		gigabyte_ids_exit();
+		return err;
+	}
 
 	dmi_check_system(it87_dmi_table);
 
@@ -6112,16 +7087,34 @@ static int __init sm_it87_init(void)
 	return 0;
 
 exit_unregister:
+	if (it87_pdev[1]) {
+		platform_device_unregister(it87_pdev[1]);
+		it87_pdev[1] = NULL;
+	}
+	if (it87_pdev[0]) {
+		platform_device_unregister(it87_pdev[0]);
+		it87_pdev[0] = NULL;
+	}
+
+	it87_h2_global_release();
 	platform_driver_unregister(&it87_driver);
+	gigabyte_ids_exit();
 	return err;
 }
 
 static void __exit sm_it87_exit(void) {
-	/* NULL check handled by platform_device_unregister */
-	platform_device_unregister(it87_pdev[1]);
-	platform_device_unregister(it87_pdev[0]);
+	if (it87_pdev[1]) {
+		platform_device_unregister(it87_pdev[1]);
+		it87_pdev[1] = NULL;
+	}
+	if (it87_pdev[0]) {
+		platform_device_unregister(it87_pdev[0]);
+		it87_pdev[0] = NULL;
+	}
+
 	it87_h2_global_release();
 	platform_driver_unregister(&it87_driver);
+	gigabyte_ids_exit();
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>, Frank Crawford");
