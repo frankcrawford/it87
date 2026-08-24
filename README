@@ -160,7 +160,7 @@ Adds support for extra fan channels only present in H2RAM on high end Gigabyte m
 Driver has been updated to use Gigabyte SMI commands rather than WMI.
 This change is necessary to provide proper support for MMIO on boards without WMI.
 
-This board also adds two userspace readable sysfs entries. This is to facilitate feature support for cooling and RGB control applications.
+This driver also adds two userspace readable sysfs entries. This is to facilitate feature support for cooling and RGB control applications.
 Here are the pathways and their uses.
 
 SIV (superio configuration and mapping):

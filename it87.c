@@ -1183,6 +1183,7 @@ static u32 gigabyte_siv;
 static u32 gigabyte_lid;
 static bool gigabyte_siv_valid;
 static bool gigabyte_lid_valid;
+static bool gigabyte_dmi_valid;
 static struct class *gigabyte_class;
 static struct device *gigabyte_dev;
 
@@ -1307,6 +1308,18 @@ static int gbw_read_siv_info(struct gbw_mgid_info *out)
 	if (ret)
 		return ret;
 	return gbw_parse_mgid(mgid, out);
+}
+
+/*
+ * All Gigabyte-specific MMIO bridge, H2RAM and firmware-control workarounds
+ * require both a Gigabyte DMI match and a successfully read, parseable SIV.
+ * Native IT87 MMIO support is intentionally not covered by this predicate.
+ */
+static bool gigabyte_platform_valid(void)
+{
+	struct gbw_mgid_info info;
+
+	return gigabyte_dmi_valid && !gbw_read_siv_info(&info) && info.supported;
 }
 
 /* Convenience getters for individual SIV/MGID fields */
@@ -2567,8 +2580,9 @@ static bool it87_uses_h2ram_vectors(const struct it87_data *data, int nr)
 
 static bool it87_needs_extra_vector_disable(const struct it87_data *data)
 {
-	return data->type == it8689 ||
-	       (data->type == it8688 && data->revision >= 0x02);
+	return gigabyte_platform_valid() &&
+	       (data->type == it8689 ||
+	        (data->type == it8688 && data->revision >= 0x02));
 }
 
 static u16 it87_h2ram_vector_base(const struct it87_data *data, int nr)
@@ -2620,10 +2634,19 @@ static bool it87_h2ram_tach_channel(const struct it87_data *data, int nr)
 
 static void it87_h2ram_set_smartfan(struct it87_data *data, bool enable)
 {
-	u8 val = enable ? 0x01 : 0x00;
 	int cur = data->read(data, IT87_SMARTFAN_ENABLE);
+	u8 val;
 
-	if (cur >= 0 && (u8)cur == val)
+	if (cur < 0)
+		return;
+
+	val = (u8)cur;
+	if (enable)
+		val |= BIT(0);
+	else
+		val &= ~BIT(0);
+
+	if (val == (u8)cur)
 		return;
 
 	data->write(data, IT87_SMARTFAN_ENABLE, val);
@@ -2923,7 +2946,8 @@ static void it87_restore_extra_vectors(struct it87_data *data, int nr,
 }
 
 /* Put active software-owned channels back on their exact firmware snapshots. */
-static void it87_restore_overrides_to_firmware(struct it87_data *data)
+static void it87_restore_overrides_to_firmware(struct it87_data *data,
+						 bool release)
 {
 	u8 mask = data->pwm_override_mask;
 	int i;
@@ -2933,15 +2957,17 @@ static void it87_restore_overrides_to_firmware(struct it87_data *data)
 			continue;
 
 		if (it87_uses_h2ram_vectors(data, i)) {
-			it87_h2ram_restore_vector(data, i, false);
+			it87_h2ram_restore_vector(data, i, release);
 		} else if (it87_uses_conventional_override(data, i)) {
-			it87_restore_conventional_pwm(data, i, false);
-			it87_restore_extra_vectors(data, i, false);
+			it87_restore_conventional_pwm(data, i, release);
+			it87_restore_extra_vectors(data, i, release);
 		}
 	}
 
 	/* Shared ownership is relinquished only after every channel is restored. */
-	it87_h2ram_restore_global_snapshot(data, false);
+	it87_h2ram_restore_global_snapshot(data, release);
+	if (release)
+		data->pwm_override_mask = 0;
 }
 
 /* Re-assert the exact software override after a successful system resume. */
@@ -3069,6 +3095,31 @@ static void it87_unlock(struct it87_data *data)
 	mutex_unlock(&data->update_lock);
 }
 
+/*
+ * Device-managed teardown runs while the register backend and shared MMIO
+ * bridge are still alive.  Restore every software-owned fan channel to the
+ * exact state captured before takeover.
+ */
+static void it87_restore_firmware_state(void *arg)
+{
+	struct it87_data *data = arg;
+	int err;
+
+	if (!data->pwm_override_mask)
+		return;
+
+	err = it87_lock(data);
+	if (err) {
+		pr_warn("unable to restore firmware fan state during teardown: %d\n",
+			err);
+		return;
+	}
+
+	it87_restore_overrides_to_firmware(data, true);
+	data->suspend_defaults_restored = false;
+	it87_unlock(data);
+}
+
 static struct it87_data *it87_update_device(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
@@ -3116,12 +3167,13 @@ static struct it87_data *it87_update_device(struct device *dev)
 			/*
 			 * IT879x G3 and IT57xx tachometers live in H2RAM.  Handle
 			 * them before the legacy register arrays; fan7 has no legacy
-			 * EC register slot at all.
+			 * EC register slot at all.  Only fanN_input is meaningful for
+			 * these channels; the legacy EC min/alarm/beep/divisor state
+			 * does not describe the H2RAM tachometer path.
 			 */
 			if (it87_h2ram_tach_regs(data, i, &tach_lsb, &tach_msb)) {
 				data->fan[i][0] = data->read(data, tach_lsb);
 				data->fan[i][0] |= data->read(data, tach_msb) << 8;
-				data->fan[i][1] = 0;
 				continue;
 			}
 
@@ -3831,7 +3883,22 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			data->pwm_override_mask &= ~BIT(nr);
 			it87_h2ram_release_control_if_idle(data);
 		} else {
-			pwm = val == 0 ? pwm_to_reg(data, 0xff) : data->pwm_duty[nr];
+			if (val == 0) {
+				pwm = pwm_to_reg(data, 0xff);
+			} else if (it87_is_it57xx_channel(data, nr) &&
+				   !(data->pwm_override_mask & BIT(nr))) {
+				/*
+				 * IT57xx has no live PWM feedback in automatic mode.
+				 * Seed the first manual takeover from the firmware
+				 * vector's existing Start PWM byte. This is not a
+				 * live-duty reading; it is only the initial constant
+				 * duty used when the vector is flattened.
+				 */
+				pwm = data->read(data,
+					it87_h2ram_vector_base(data, nr) + 4);
+			} else {
+				pwm = data->pwm_duty[nr];
+			}
 			data->pwm_override_mask |= BIT(nr);
 			data->pwm_override_mode[nr] = val;
 			data->pwm_override_duty[nr] = pwm;
@@ -4643,7 +4710,8 @@ static int __init gigabyte_ids_init(void)
 {
 	int ret;
 
-	if (!dmi_check_system(gigabyte_dmi_table))
+	gigabyte_dmi_valid = dmi_check_system(gigabyte_dmi_table);
+	if (!gigabyte_dmi_valid)
 		return 0;
 
 	gigabyte_siv_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_SIV_ID,
@@ -4701,6 +4769,10 @@ static void gigabyte_ids_exit(void)
 		class_destroy(gigabyte_class);
 		gigabyte_class = NULL;
 	}
+
+	gigabyte_siv_valid = false;
+	gigabyte_lid_valid = false;
+	gigabyte_dmi_valid = false;
 }
 
 static umode_t it87_in_is_visible(struct kobject *kobj,
@@ -4914,10 +4986,18 @@ static umode_t it87_fan_is_visible(struct kobject *kobj,
 	int i = index / 5;	/* fan index */
 	int a = index % 5;	/* attribute index */
 
-	if (index >= 15) {	/* fan 4..6 don't have divisor attributes */
+	if (index >= 15) {	/* fan 4..7 don't have divisor attributes */
 		i = (index - 15) / 4 + 3;
 		a = (index - 15) % 4;
 	}
+
+	/*
+	 * H2RAM tachometer channels use a separate register path from the
+	 * legacy EC fan monitor.  Only fanN_input is valid for those channels;
+	 * fanN_min, fanN_alarm, fanN_beep and fanN_div describe EC state.
+	 */
+	if (it87_h2ram_tach_channel(data, i) && a != 0)
+		return 0;
 
 	if (!(data->has_fan & BIT(i)))
 		return 0;
@@ -5182,6 +5262,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 	u16 chip_type;
 	int err;
 	bool enabled = false;
+	bool gigabyte_ok;
 
 	/* First step, lock memory but don't enter configuration mode */
 	err = superio_enter(sioaddr, true);
@@ -5326,6 +5407,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 	}
 
 	config = &it87_devices[sio_data->type];
+	gigabyte_ok = gigabyte_platform_valid();
 
 	/*
 	 * If previously we didn't enter configuration mode and it isn't a
@@ -5355,8 +5437,9 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 
 	err = 0;
 	sio_data->revision = superio_inb(sioaddr, DEVREV) & 0x0f;
-	/* Check for standard mmio support. If so, then compose base address*/
-	if ((has_mmio(config) || has_bridge_mmio(config)) && mmio) {
+	/* Native MMIO is generic; ISA-bridge MMIO is Gigabyte-specific. */
+	if (mmio && (has_mmio(config) ||
+		     (has_bridge_mmio(config) && gigabyte_ok))) {
 		u8 reg;
 
 		reg = superio_inb(sioaddr, IT87_EC_HWM_MIO_REG);
@@ -5364,15 +5447,15 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 			base = 0xf0000000 + ((reg & 0x0f) << 24);
 			base += (reg & 0xc0) << 14;
 
-			if (has_bridge_mmio(config)) {
+			if (has_bridge_mmio(config) && gigabyte_ok) {
 			    sio_data->mmio_bridge = 1;
 			} else {
 				sio_data->mmio = 1;
 			}
 		}
 	}
-	/* Check for H2RAM MMIO */
-	if (has_h2ram_mmio(config) && mmio) {
+	/* H2RAM MMIO/ECIO is a Gigabyte-specific firmware interface. */
+	if (has_h2ram_mmio(config) && mmio && gigabyte_ok) {
 		u8 enable;
 		u8 reg;
 		u8 reg1;
@@ -6035,6 +6118,9 @@ static void it87_detect_h2ram_smartfan(struct device *dev,
 	bool siv_valid = false;
 	int i, channels;
 
+	if (!gigabyte_platform_valid())
+		return;
+
 	if (!data->mmio_h2ram && !data->ecio_h2ram)
 		return;
 
@@ -6610,6 +6696,14 @@ static int it87_probe(struct platform_device *pdev)
 			data->groups[5] = &it87_group_auto_pwm;
 	}
 
+	/*
+	 * Register this before the hwmon device so devres teardown removes
+	 * sysfs first, then restores firmware state while the bridge still exists.
+	 */
+	err = devm_add_action_or_reset(dev, it87_restore_firmware_state, data);
+	if (err)
+		return err;
+
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
 			     it87_devices[sio_data->type].name,
 			     data, data->groups);
@@ -6663,7 +6757,7 @@ static int it87_suspend(struct device *dev)
 		 * desired software values in memory so a successful resume can retake
 		 * control without changing what "automatic" means.
 		 */
-		it87_restore_overrides_to_firmware(data);
+		it87_restore_overrides_to_firmware(data, false);
 		data->suspend_defaults_restored = true;
 		data->valid = false;
 	}
