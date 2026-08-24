@@ -132,27 +132,42 @@ Device Support
 TODOS:
 ------
 
-Add vector support. This is the feature you see if the bios for setting automatic fan curves.
+Add vector support. This is the feature you see in the bios for setting automatic fan curves.
 
-Add support for H2RAM based fans. (High end boards use an IT57xx chip for additional fan channels).
-This is typically found on boards with over 8 fan channels.
+Add OLED status monitoring and setting (for certain boards with this feature).
 
-Fix it8689 control issues. Some Gigabyte motherboards with it8689 don't allow for manual control.
-This is a known issue and the fix is known but complex. 
-For now, a BIOS curve workaround is required for manual control.
-If you truly want/need fan control for these boards set this curve in the BIOS for each fan channel:
-(Note that some boards don't allow for 90C so manual control may stop above that threshold temp).
+Add USB2DACUP voltage setting and monitoring (for certain boards with this feature).
 
-/*-----------------------------------------*\
-| Point | 1  | 2  | 3  | 4  | 5  | 6  |  7  |
-|-------|----|----|----|----|----|----|-----|
-|  PWM  | 40 | 40 | 40 | 40 | 40 | 40 | 100 |
-|-------|----|----|----|----|----|----|-----|
-| TEMP  | 0  | 90 | 90 | 90 | 90 | 90 | 90  |
-\*------|----|----|----|----|----|----|----*/
+Add Noise Monitoring Support (For certain boards with this feature).
+
 
 CHANGELOG:
 =========
+
+SUPPORT NOTE - Aug 2026
+============
+
+Adds full support for setting manual modes on all fan channels with workarounds for any problematic chips.
+This should fix control for the following chips:
+* IT8688
+* IT8689
+* IT8790
+* IT8792/IT8795
+* IT87952
+
+Adds support for extra fan channels only present in H2RAM on high end Gigabyte motherboards.
+
+Driver has been updated to use Gigabyte SMI commands rather than WMI.
+This change is necessary to provide proper support for MMIO on boards without WMI.
+
+This board also adds two userspace readable sysfs entries. This is to facilitate feature support for cooling and RGB control applications.
+Here are the pathways and their uses.
+
+SIV (superio configuration and mapping):
+"/sys/devices/virtual/gigabyte/id/gigabyte_siv"
+LID (RGB controller configuration and mapping):
+"/sys/devices/virtual/gigabyte/id/gigabyte_lid"
+
 
 SUPPORT NOTE - Mar 2026
 ============
