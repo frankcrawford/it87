@@ -1129,6 +1129,7 @@ struct it87_data {
 	u8 pwm_override_mode[NUM_PWM];
 	u8 pwm_override_duty[NUM_PWM];
 	bool suspend_defaults_restored;
+	bool probe_complete;
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -2152,7 +2153,7 @@ static int it87_h2_global_init(void)
 	return ret;
 }
 
-/* Configure a slot (just updates state, does not touch PCI yet) */
+/* Prepare a slot; activation is deferred until the resource-backed probe. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -2165,6 +2166,32 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 	mutex_unlock(&mmio_lock);
 
 	return ret;
+}
+
+static int it87_h2_global_activate_slot(int idx)
+{
+	int ret;
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready)
+		ret = -ENODEV;
+	else
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
+	mutex_unlock(&mmio_lock);
+
+	return ret;
+}
+
+static struct device *it87_h2_global_parent(void)
+{
+	struct device *parent = NULL;
+
+	mutex_lock(&mmio_lock);
+	if (it87_h2_global_ready && it87_h2_global.bridge)
+		parent = &it87_h2_global.bridge->dev;
+	mutex_unlock(&mmio_lock);
+
+	return parent;
 }
 
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
@@ -6713,6 +6740,37 @@ static int it87_check_pwm(struct device *dev)
 	return 1;
 }
 
+static int it87_request_io_resource(struct device *dev,
+				    struct resource *res, const char *name,
+				    bool check_acpi_conflict)
+{
+	int err;
+
+	if (!res) {
+		dev_err(dev, "%s resource is unavailable\n", name);
+		return -ENODEV;
+	}
+
+	if (check_acpi_conflict) {
+		err = acpi_check_resource_conflict(res);
+		if (err) {
+			if (dmi_data && dmi_data->skip_acpi_res)
+				dev_info(dev,
+					 "Ignoring expected ACPI resource conflict for %s\n",
+					 name);
+			else if (!ignore_resource_conflict)
+				return err;
+		}
+	}
+
+	if (!devm_request_region(dev, res->start, resource_size(res), DRVNAME)) {
+		dev_err(dev, "Failed to request %s region %pR\n", name, res);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 static int it87_probe(struct platform_device *pdev)
 {
 	struct it87_data      *data;
@@ -6723,6 +6781,8 @@ static int it87_probe(struct platform_device *pdev)
 	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
 	int                    enable_pwm_interface;
 	struct device         *hwmon_dev;
+	bool                   io_requested = false;
+	int                    mmio_err = 0;
 	int                    err;
 
 	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
@@ -6736,43 +6796,26 @@ static int it87_probe(struct platform_device *pdev)
      *   IORESOURCE_MEM index 0: MMIO/H2RAM window
      */
 
-	/* Primary EC I/O window (always present) */
+	/* Primary EC I/O window, including the MMIO fallback path */
 	res_io = platform_get_resource(pdev, IORESOURCE_IO, 0);
-	if (res_io) {
-		if (!devm_request_region(dev, res_io->start, IT87_EC_EXTENT,
-					 DRVNAME)) {
-			dev_err(dev, "Failed to request Conventional IO region %pR\n", res_io);
-			return -EBUSY;
-		}
-	}
-
-	/* Extended EC I/O window */
 	res_ecio = platform_get_resource(pdev, IORESOURCE_IO, 1);
-	if (res_ecio) {
-		if (!devm_request_region(dev, res_ecio->start, EXT_ECIO_EXTENT,
-					 DRVNAME)) {
-			dev_err(dev, "Failed to request Extended ECIO region %pR\n", res_ecio);
-			return -EBUSY;
-		}
-	}
 
-	/* Map Memory resources for MMIO */
+	/* Map the preferred MMIO transport before claiming an optional fallback. */
 	res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (res_mmio)
-	{
+	if (res_mmio) {
 		data->mmio = devm_ioremap_resource(dev, res_mmio);
-		if (IS_ERR(data->mmio))
-			return PTR_ERR(data->mmio);
-	}
-	else
-	{
+		if (IS_ERR(data->mmio)) {
+			mmio_err = PTR_ERR(data->mmio);
+			data->mmio = NULL;
+		}
+	} else {
 		data->mmio = NULL;
 	}
 
-	if(res_io)
+	if (res_io)
 		data->addr = res_io->start;
 	else
-		data->addr = 0;    /* no conventional EC I/O available */
+		data->addr = 0;
 	data->type              = sio_data->type;
 	data->revision          = sio_data->revision;
 	data->sioaddr           = sio_data->sioaddr;
@@ -6784,9 +6827,40 @@ static int it87_probe(struct platform_device *pdev)
 	data->pwm_num_temp_map  = it87_devices[sio_data->type].num_temp_map;
 	data->peci_mask         = it87_devices[sio_data->type].peci_mask;
 	data->old_peci_mask     = it87_devices[sio_data->type].old_peci_mask;
-	data->mmio_bridge       = sio_data->mmio_bridge;
-	data->mmio_h2ram        = sio_data->mmio_h2ram;
+	data->mmio_bridge       = data->mmio && sio_data->mmio_bridge;
+	data->mmio_h2ram        = data->mmio && sio_data->mmio_h2ram;
 	data->ecio_h2ram        = sio_data->ecio_h2ram;
+
+	/*
+	 * Conventional I/O is the primary transport without MMIO and supplies
+	 * the low half of both H2RAM hybrid transports.
+	 */
+	if (!data->mmio || data->mmio_h2ram || data->ecio_h2ram) {
+		err = it87_request_io_resource(dev, res_io,
+					       "conventional I/O",
+					       sio_data->mmio ||
+					       sio_data->mmio_bridge);
+		if (err) {
+			if (mmio_err)
+				dev_err(dev,
+					 "MMIO mapping failed (%d) and conventional I/O fallback failed (%d)\n",
+					 mmio_err, err);
+			return err;
+		}
+		io_requested = true;
+		if (mmio_err)
+			dev_warn(dev,
+				 "MMIO mapping failed (%d), using conventional I/O\n",
+				 mmio_err);
+	}
+
+	/* Extended EC I/O window */
+	if (res_ecio) {
+		err = it87_request_io_resource(dev, res_ecio, "extended ECIO",
+					       false);
+		if (err)
+			return err;
+	}
 
 	switch(data->type)
 	{
@@ -6812,7 +6886,42 @@ static int it87_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, data);
 	mutex_init(&data->update_lock);
 
-	/* Initialize register accessors (select IO vs MMIO backend) */
+	/*
+	 * Activate a validated forwarding slot before selecting MMIO accessors.
+	 * If activation fails, stop using the mapping and retry initialization
+	 * through the conventional I/O resource when it is available.
+	 */
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_activate_slot(slot);
+		if (err) {
+			int bridge_err = err;
+
+			if (!io_requested) {
+				err = it87_request_io_resource(dev, res_io,
+							      "conventional I/O",
+							      true);
+				if (err) {
+					dev_err(dev,
+						"ISA bridge activation failed (%d) and conventional I/O fallback failed (%d)\n",
+						bridge_err, err);
+					return bridge_err;
+				}
+				io_requested = true;
+			}
+
+			dev_warn(dev,
+				 "ISA bridge activation failed (%d), using conventional I/O\n",
+				 bridge_err);
+			/* The unused mapping remains devres-managed until teardown. */
+			data->mmio = NULL;
+			data->mmio_bridge = false;
+			data->mmio_h2ram = false;
+		}
+	}
+
+	/* Initialize register accessors after the final transport is known. */
 	it87_init_regs(pdev);
 
 	/* Disable SMBus shadowing while probing sensor blocks */
@@ -6945,7 +7054,11 @@ static int it87_probe(struct platform_device *pdev)
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
 			     it87_devices[sio_data->type].name,
 			     data, data->groups);
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+	if (IS_ERR(hwmon_dev))
+		return PTR_ERR(hwmon_dev);
+
+	data->probe_complete = true;
+	return 0;
 }
 
 static void it87_resume_sio(struct platform_device *pdev)
@@ -7053,9 +7166,24 @@ static struct platform_driver it87_driver = {
 	.driver = {
 		.name	= DRVNAME,
 		.pm	= pm_sleep_ptr(&it87_dev_pm_ops),
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
 	.probe	= it87_probe,
 };
+
+static bool it87_probe_completed(struct platform_device *pdev)
+{
+	struct it87_data *data;
+	bool complete;
+
+	device_lock(&pdev->dev);
+	data = platform_get_drvdata(pdev);
+	complete = pdev->dev.driver == &it87_driver.driver && data &&
+		   data->probe_complete;
+	device_unlock(&pdev->dev);
+
+	return complete;
+}
 
 static int __init it87_device_add(int index, unsigned short sio_address,
 				  phys_addr_t mmio_address,
@@ -7068,7 +7196,7 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 
 	memset(res, 0, sizeof(res));
 
-	/* Only allocate IO Ports if we don't use MMIO */
+	/* Allocate I/O ports for I/O users and as an unclaimed MMIO fallback. */
 	if (!((sio_data->mmio_bridge || sio_data->mmio) && mmio_address)) {
 		/*
 		* 1) Primary EC I/O window (If enabled, ACPI-checked)
@@ -7111,6 +7239,12 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 
 			nres++;
 		}
+	} else {
+		res[nres].name  = DRVNAME;
+		res[nres].start = sio_address + IT87_EC_OFFSET;
+		res[nres].end   = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
+		res[nres].flags = IORESOURCE_IO;
+		nres++;
 	}
 
 	/* Secondary MMIO Resource*/
@@ -7119,8 +7253,16 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		phys_addr_t start = mmio_address;
 		phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
-		/* H2RAM chips have an extra EC/HWM block mapped into the window
-	 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
+		/*
+		 * The chipset's 64 KiB decode is a forwarding aperture, not
+		 * exclusive IT87 ownership.  Reserve only the IT87 register
+		 * subrange modeled by this child.
+		 */
+
+		/*
+		 * H2RAM chips have an extra EC/HWM block mapped into the window
+		 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF.
+		 */
 		if (sio_data->mmio_h2ram)
 		{
 			start = mmio_address;
@@ -7137,6 +7279,14 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 	pdev = platform_device_alloc(DRVNAME, sio_address);
 	if (!pdev)
 		return -ENOMEM;
+
+	if (sio_data->mmio_bridge || sio_data->mmio_h2ram) {
+		pdev->dev.parent = it87_h2_global_parent();
+		if (!pdev->dev.parent) {
+			err = -ENODEV;
+			goto exit_device_put;
+		}
+	}
 
 	err = platform_device_add_resources(pdev, res, nres);
 	if (err)
@@ -7159,10 +7309,19 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
+	/* Never retain an unbound, incompletely validated device. */
+	if (!it87_probe_completed(pdev)) {
+		pr_err("Device probe failed for Super I/O at %#x\n",
+		       sio_address);
+		err = -ENODEV;
+		goto exit_device_del;
+	}
 
 	it87_pdev[index] = pdev;
 	return 0;
 
+exit_device_del:
+	platform_device_del(pdev);
 exit_device_put:
 	platform_device_put(pdev);
 	return err;
@@ -7380,29 +7539,32 @@ static int __init sm_it87_init(void)
 	 * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
 	 * the global H2 manager slot for it.
 	 */
-		if (mmio_address &&
-	   (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
+		if (sio_data.mmio_bridge || sio_data.mmio_h2ram) {
 			phys_addr_t base = mmio_address;
 			int         slot;
-			int         ret;
+			int         ret = 0;
 
-			if (!it87_h2_global_inited) {
+			if (!base)
+				ret = -EINVAL;
+			if (!ret && !it87_h2_global_inited) {
 				ret = it87_h2_global_init();
-				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
-				} else {
+				if (!ret)
 					it87_h2_global_inited = true;
-				}
 			}
-			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
-				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
+			if (!ret && !it87_h2_global_ready)
+				ret = -ENODEV;
+
+			/* slot 0 = 0x2E, slot 1 = 0x4E */
+			slot = sioaddr[i] == REG_4E ? 1 : 0;
+			if (!ret)
 				ret = it87_h2_global_set_slot(slot, base);
-				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
-				}
+			if (ret) {
+				pr_warn("ISA bridge MMIO setup failed for Super I/O %#x at %pa (%d), using conventional I/O\n",
+					sioaddr[i], &base, ret);
+				sio_data.mmio = false;
+				sio_data.mmio_bridge = false;
+				sio_data.mmio_h2ram = false;
+				mmio_address = 0;
 			}
 		}
 
@@ -7419,6 +7581,7 @@ static int __init sm_it87_init(void)
 	return 0;
 
 exit_unregister:
+	/* Child devres restores firmware fan state before bridge release. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
@@ -7435,6 +7598,7 @@ exit_unregister:
 }
 
 static void __exit sm_it87_exit(void) {
+	/* Unregister children before restoring and releasing the shared bridge. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
