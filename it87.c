@@ -70,6 +70,7 @@
 #include <linux/hwmon-vid.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/atomic.h>
 #include <linux/mutex.h>
 #include <linux/preempt.h>
 #include <linux/sysfs.h>
@@ -230,16 +231,44 @@ static inline void superio_exit(int ioreg, bool noexit)
 	release_region(ioreg, 2);
 }
 
+/*
+ * PCI configuration helpers return PCIBIOS_* status values.  Keep the
+ * conversion local since pcibios_err_to_errno() is not available on every
+ * kernel supported by this out-of-tree driver.
+ */
+static inline int it87_pcibios_err_to_errno(int err)
+{
+	if (err <= PCIBIOS_SUCCESSFUL)
+		return err;
+
+	switch (err) {
+	case PCIBIOS_FUNC_NOT_SUPPORTED:
+		return -ENOENT;
+	case PCIBIOS_BAD_VENDOR_ID:
+		return -ENOTTY;
+	case PCIBIOS_DEVICE_NOT_FOUND:
+		return -ENODEV;
+	case PCIBIOS_BAD_REGISTER_NUMBER:
+		return -EFAULT;
+	case PCIBIOS_SET_FAILED:
+		return -EIO;
+	case PCIBIOS_BUFFER_TOO_SMALL:
+		return -ENOSPC;
+	default:
+		return -ERANGE;
+	}
+}
+
 /* PCI Read Routine */
 static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
 {
-	return pci_read_config_dword(d, off, v);
+	return it87_pcibios_err_to_errno(pci_read_config_dword(d, off, v));
 }
 
 /* PCI Write Routine */
 static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 {
-	return pci_write_config_dword(d, off, v);
+	return it87_pcibios_err_to_errno(pci_write_config_dword(d, off, v));
 }
 
 /* Logical device 4 registers */
@@ -1101,6 +1130,7 @@ struct it87_data {
 	u8 pwm_override_mode[NUM_PWM];
 	u8 pwm_override_duty[NUM_PWM];
 	bool suspend_defaults_restored;
+	bool probe_complete;
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -1402,11 +1432,13 @@ struct it87_h2ram_handle
 	u32 rd8[2];
 	u32 r98[2];
 	bool have[2];
+	bool slots_valid;
 
 	u32 hidden_base;   		/* hidden base address for z390/skylake bridges */
 	bool hidden_ready;       /* hidden window ready/available */
-	/* AMD/Intel: track currently programmed base to minimize churn */
+	/* Track both fields: separate slots may legitimately share a base. */
 	u32 current_base;
+	int current_slot;
 };
 
 /* Global MMIO bridge state tracking */
@@ -1414,6 +1446,8 @@ static struct it87_h2ram_handle it87_h2_global;
 static bool                    it87_h2_global_ready;
 /* Only call it87_h2_global_init() once from sm_it87_init() */
 static bool                    it87_h2_global_inited;
+/* First manager-wide slot-programming failure; zero means healthy. */
+static atomic_t                it87_h2_global_error = ATOMIC_INIT(0);
 
 /*
  * Intel ISA bridge types:
@@ -1431,18 +1465,23 @@ enum it87_isabridge_type {
 /* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
 /* Helpers for Intel type bridges */
-static inline void it87_hidden_cleanup(struct pci_dev *pch_f0,
-									   struct pci_dev *pch_f1,
-									   bool e1_changed)
+static inline int it87_hidden_cleanup(struct pci_dev *pch_f0,
+				      struct pci_dev *pch_f1,
+				      bool e1_changed, u8 e1_orig)
 {
+	int ret = 0;
+
 	if (pch_f1 && e1_changed) {
-		pci_write_config_byte(pch_f1, 0xE1, 0xFF);
+		ret = it87_pcibios_err_to_errno(
+			pci_write_config_byte(pch_f1, 0xE1, e1_orig));
 		msleep(1);
 	}
 	if (pch_f1)
 		pci_dev_put(pch_f1);
 	if (pch_f0)
 		pci_dev_put(pch_f0);
+
+	return ret;
 }
 
 /* checks for compatible skylake bridges */
@@ -1480,7 +1519,7 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 	u32 bar0 = 0;
 	u8 e1 = 0;
 	bool e1_changed = false;
-	int ret;
+	int cleanup_ret, ret;
 	u32 hidden_ofs = 0;
 	u8 platform = 0;
 	int siv_ret;
@@ -1515,39 +1554,55 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, NULL, false);
-			return 0;
+			ret = 0;
+		} else {
+			ret = -ENODEV;
 		}
-		it87_hidden_cleanup(pch_f0, NULL, false);
-		return -ENODEV;
-		}
+		goto cleanup;
+	}
 
-	ret = pci_read_config_byte(pch_f1, 0xE1, &e1);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+	ret = it87_pcibios_err_to_errno(
+		pci_read_config_byte(pch_f1, 0xE1, &e1));
+	if (ret)
+		goto cleanup;
 	if (e1 != 0x10) {
-		ret = pci_write_config_byte(pch_f1, 0xE1, 0x10);
-		if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+		ret = it87_pcibios_err_to_errno(
+			pci_write_config_byte(pch_f1, 0xE1, 0x10));
+		if (ret)
+			goto cleanup;
 		msleep(1);
 		e1_changed = true;
 	}
 
-	ret = pci_read_config_dword(pch_f1, 0x10, &bar0);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, e1_changed); return ret; }
+	ret = it87_pcibios_err_to_errno(
+		pci_read_config_dword(pch_f1, 0x10, &bar0));
+	if (ret)
+		goto cleanup;
 	if (!bar0 || bar0 == 0xFFFFFFFFu) {
 		/* BAR0 unavailable: apply Z390 fixed base fallback when requested */
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-			return 0;
+			ret = 0;
+		} else {
+			ret = -EIO;
 		}
-		it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-		return -EIO;
+		goto cleanup;
 	}
 	h->hidden_base = (bar0 & 0xFF000000u) + hidden_ofs;
 	h->hidden_ready = true;
-	it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-	return 0;
+	ret = 0;
+
+cleanup:
+	cleanup_ret = it87_hidden_cleanup(pch_f0, pch_f1, e1_changed, e1);
+	if (cleanup_ret) {
+		if (ret)
+			pr_warn("Intel hidden-function access failed (%d) and selector restoration failed (%d)\n",
+				ret, cleanup_ret);
+		return cleanup_ret;
+	}
+
+	return ret;
 }
 
 /* ----- Intel BIOS Data/Feature mask helpers ----- */
@@ -1586,6 +1641,18 @@ static u16 _intel_bios_mask_for_feat_space(u32 base)
 	if ((base & ~0x7FFFF) == 0xFFB00000) return 0x4000;
 	if ((base & ~0x7FFFF) == 0xFFB80000) return 0x8000;
 	return 0;
+}
+
+static void it87_record_first_error(int *first, int err)
+{
+	if (err && !*first)
+		*first = err;
+}
+
+static void it87_hidden_write_flush(void __iomem *base, u32 reg, u32 value)
+{
+	writel(value, base + reg);
+	(void)readl(base + reg);
 }
 
 /* ----- internal save/restore of original bridge state ----- */
@@ -1638,53 +1705,126 @@ static int _save_regs(struct it87_h2ram_handle *h)
 	return 0;
 }
 
-static void _restore_regs(struct it87_h2ram_handle *h)
+static int _restore_amd_regs(struct it87_h2ram_handle *h)
 {
-	void __iomem *hb;
+	int first = 0;
 	int ret;
-	u16 v;
 
-	if (!h || !h->bridge || !h->saved)
-		return;
+	/* A range register is safe to change only after decode is disabled. */
+	ret = pci_reg_write(h->bridge, 0x48, h->or48 & ~BIT(5));
+	it87_record_first_error(&first, ret);
+	if (ret)
+		return first;
 
-	v = h->bridge->vendor;
-	if (v == IT87_H2_VENDOR_AMD) {
+	h->current_base = 0;
+	h->current_slot = -1;
+
+	/* Both writes are safe while decode is disabled; attempt each one. */
+	ret = pci_reg_write(h->bridge, 0x60, h->or60);
+	it87_record_first_error(&first, ret);
+	ret = pci_reg_write(h->bridge, 0x6c, h->or6c);
+	it87_record_first_error(&first, ret);
+
+	if (!first) {
 		ret = pci_reg_write(h->bridge, 0x48, h->or48);
-		if (ret)
-			pr_warn("failed to restore AMD bridge register 0x48: %d\n", ret);
-		ret = pci_reg_write(h->bridge, 0x60, h->or60);
-		if (ret)
-			pr_warn("failed to restore AMD bridge register 0x60: %d\n", ret);
-		ret = pci_reg_write(h->bridge, 0x6C, h->or6c);
-		if (ret)
-			pr_warn("failed to restore AMD bridge register 0x6c: %d\n", ret);
-	} else if (v == IT87_H2_VENDOR_INTEL) {
-		/* Mirror hidden first, then PCI config */
-		if (h->hidden_saved && h->hidden_base) {
-			hb = ioremap(h->hidden_base, 0x200);
-			if (hb) {
-				writel(h->hidden_orig_0x40, hb + 0x40);
-				writel(h->hidden_orig_0x44, hb + 0x44);
-				/* Flush posted writes before the mapping is dropped. */
-				(void)readl(hb + 0x44);
-				iounmap(hb);
-			} else {
-				pr_warn("unable to map Intel hidden bridge window while restoring state\n");
-			}
-		}
-		ret = pci_reg_write(h->bridge, 0xD8, h->ord8);
-		if (ret)
-			pr_warn("failed to restore Intel bridge register 0xd8: %d\n", ret);
-		ret = pci_reg_write(h->bridge, 0x98, h->or98);
-		if (ret)
-			pr_warn("failed to restore Intel bridge register 0x98: %d\n", ret);
+		it87_record_first_error(&first, ret);
 	}
 
-	/* Never trust the cached slot after a restore or rollback. */
+	if (first)
+		(void)pci_reg_write(h->bridge, 0x48, h->or48 & ~BIT(5));
+
+	return first;
+}
+
+static int _restore_intel_regs(struct it87_h2ram_handle *h,
+				       void __iomem *mapped_hidden)
+{
+	void __iomem *hb = mapped_hidden;
+	u32 pci_base;
+	int first = 0;
+	int ret;
+	bool hidden_disabled = !h->hidden_saved;
+	bool pci_disabled = false;
+	bool unmap_hidden = false;
+
 	h->current_base = 0;
+	h->current_slot = -1;
+
+	if (h->hidden_saved && !hb) {
+		hb = ioremap(h->hidden_base, 0x200);
+		if (!hb)
+			it87_record_first_error(&first, -ENOMEM);
+		else
+			unmap_hidden = true;
+	}
+
+	if (hb) {
+		pci_base = readl(hb + 0x40);
+		it87_hidden_write_flush(hb, 0x40, pci_base & ~BIT(0));
+		hidden_disabled = true;
+	}
+
+	ret = pci_reg_read(h->bridge, 0x98, &pci_base);
+	it87_record_first_error(&first, ret);
+	if (!ret) {
+		ret = pci_reg_write(h->bridge, 0x98, pci_base & ~BIT(0));
+		it87_record_first_error(&first, ret);
+		pci_disabled = !ret;
+	}
+
+	/* Do not change either mask unless every relevant decode is off. */
+	if (!hidden_disabled || !pci_disabled)
+		goto out;
+
+	if (hb)
+		it87_hidden_write_flush(hb, 0x44, h->hidden_orig_0x44);
+	ret = pci_reg_write(h->bridge, 0xd8, h->ord8);
+	it87_record_first_error(&first, ret);
+	if (ret)
+		goto fail_closed;
+
+	if (hb)
+		it87_hidden_write_flush(hb, 0x40, h->hidden_orig_0x40);
+	ret = pci_reg_write(h->bridge, 0x98, h->or98);
+	it87_record_first_error(&first, ret);
+	if (ret)
+		goto fail_closed;
+
+	goto out;
+
+fail_closed:
+	if (hb)
+		it87_hidden_write_flush(hb, 0x40,
+					h->hidden_orig_0x40 & ~BIT(0));
+	(void)pci_reg_write(h->bridge, 0x98, h->or98 & ~BIT(0));
+out:
+	if (unmap_hidden)
+		iounmap(hb);
+
+	return first;
+}
+
+static int _restore_regs(struct it87_h2ram_handle *h)
+{
+	if (!h || !h->bridge)
+		return -EINVAL;
+	if (!h->saved)
+		return 0;
+
+	if (h->bridge->vendor == IT87_H2_VENDOR_AMD)
+		return _restore_amd_regs(h);
+	if (h->bridge->vendor == IT87_H2_VENDOR_INTEL)
+		return _restore_intel_regs(h, NULL);
+
+	return -ENODEV;
 }
 
 /* ----- discrete per-slot programming ----- */
+
+/*
+ * These transactions cover only the shared bridge forwarding aperture.
+ * Controller register sequences remain serialized by their existing locks.
+ */
 
 /* AMD:
  *  slot 0 (2E): START=(base>>16)&0xFF00; END=START+1;
@@ -1698,12 +1838,19 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  */
 static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-	int ret;
+	int restore_ret, ret;
 
 	if (!h || !h->bridge)
 		return -ENODEV;
 	if (idx < 0 || idx > 1 || !h->have[idx])
 		return -EINVAL;
+
+	/* Disable decode before replacing either range register. */
+	ret = pci_reg_write(h->bridge, 0x48, h->r48[idx] & ~BIT(5));
+	if (ret)
+		return ret;
+	h->current_base = 0;
+	h->current_slot = -1;
 
 	ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
 	if (ret)
@@ -1716,10 +1863,14 @@ static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
 		goto rollback;
 
 	h->current_base = h->base[idx];
+	h->current_slot = idx;
 	return 0;
 
 rollback:
-	_restore_regs(h);
+	restore_ret = _restore_regs(h);
+	if (restore_ret)
+		pr_err("failed to restore AMD bridge after programming error %d: %d\n",
+		       ret, restore_ret);
 	return ret;
 }
 
@@ -1731,44 +1882,59 @@ rollback:
  */
 static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-	void __iomem *hb;
-	int ret;
+	void __iomem *hb = NULL;
+	int restore_ret, ret;
 
 	if (!h || !h->bridge)
 		return -ENODEV;
 	if (idx < 0 || idx > 1 || !h->have[idx])
 		return -EINVAL;
 
-	if (h->current_base == h->base[idx])
+	if (h->current_slot == idx && h->current_base == h->base[idx])
 		return 0; /* already active */
 
-	/* Hidden-window mirror first if available */
-	if (h->hidden_ready) {
+	if (h->hidden_saved) {
 		hb = ioremap(h->hidden_base, 0x200);
 		if (!hb)
 			return -ENOMEM;
-
-		writel(h->r98[idx], hb + 0x40);
-		writel(h->rd8[idx], hb + 0x44);
-		/* Flush posted writes before programming the PCI mirror. */
-		(void)readl(hb + 0x44);
-		iounmap(hb);
 	}
 
-	/* Then program PCI config */
-	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
+	/* First replace the base in both mirrors with decode disabled. */
+	if (hb)
+		it87_hidden_write_flush(hb, 0x40, h->r98[idx] & ~BIT(0));
+	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx] & ~BIT(0));
+	if (ret)
+		goto rollback;
+	h->current_base = 0;
+	h->current_slot = -1;
+
+	/* Then install the active-low mask while decode remains disabled. */
+	if (hb)
+		it87_hidden_write_flush(hb, 0x44, h->rd8[idx]);
+	ret = pci_reg_write(h->bridge, 0xd8, h->rd8[idx]);
 	if (ret)
 		goto rollback;
 
+	/* Finally enable the validated base in both mirrors. */
+	if (hb)
+		it87_hidden_write_flush(hb, 0x40, h->r98[idx]);
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
 	if (ret)
 		goto rollback;
 
+	if (hb)
+		iounmap(hb);
 	h->current_base = h->base[idx];
+	h->current_slot = idx;
 	return 0;
 
 rollback:
-	_restore_regs(h);
+	restore_ret = _restore_intel_regs(h, hb);
+	if (hb)
+		iounmap(hb);
+	if (restore_ret)
+		pr_err("failed to restore Intel bridge after programming error %d: %d\n",
+		       ret, restore_ret);
 	return ret;
 }
 
@@ -1776,10 +1942,16 @@ static int _enable_slot(struct it87_h2ram_handle *h, int idx)
 {
 	u16 v;
 
-	if (!h || !h->bridge)return -ENODEV;
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (!h->saved || !h->slots_valid)
+		return -EIO;
+
 	v = h->bridge->vendor;
-	if (v==IT87_H2_VENDOR_AMD)return 	_amd_enable_slot(h, idx);
-	if (v==IT87_H2_VENDOR_INTEL)return 	_intel_enable_slot(h, idx);
+	if (v == IT87_H2_VENDOR_AMD)
+		return _amd_enable_slot(h, idx);
+	if (v == IT87_H2_VENDOR_INTEL)
+		return _intel_enable_slot(h, idx);
 	return -ENODEV;
 }
 
@@ -1793,6 +1965,7 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 		return -EINVAL;
 
 	memset(h, 0, sizeof(*h));
+	h->current_slot = -1;
 
 	pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
 	while (pdev) {
@@ -1818,10 +1991,11 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 	     */
 			if (h->is_intel) {
 				int hret = it87_intel_init_hidden(h);
-				if (hret < 0) {
-					/* Ensure a clean generic state on failure */
-					h->hidden_ready = false;
-					h->hidden_base = 0;
+				if (hret) {
+					pci_disable_device(h->bridge);
+					pci_dev_put(h->bridge);
+					h->bridge = NULL;
+					return hret;
 				}
 			}
 
@@ -1840,63 +2014,129 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 	return -ENODEV;
 }
 
-/* Set up MMIO bridge register values */
-static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
+static int it87_h2_prepare_slot_regs(struct it87_h2ram_handle *h, int idx)
 {
 	u32 base32;
 
-	if (!h || !h->bridge)return -ENODEV;
-	if (idx<0 || idx>1)return -EINVAL;
-	if (mmio_base==0)return -EINVAL;
-	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx >= ARRAY_SIZE(h->have) || !h->have[idx])
+		return -EINVAL;
 
-	base32 = (u32)mmio_base;
-	base32 &= ~0xFFFFu;                        /* 64KiB align down */
+	base32 = h->base[idx];
+	if (!base32 || (base32 & 0xffff))
+		return -EINVAL;
 
-	h->base[idx]  = base32;
-	h->have[idx]  = true;
-
-	/* If bridge is amd calculate the register values for the bridge window of idx */
+	/* Calculate the register values for an AMD bridge window. */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
 		if (idx == 1) {
+			if ((base32 >> 16) == 0xffff)
+				return -ERANGE;
 			h->r48[idx] = (h->or48 & ~BIT(5)) | BIT(5);
 			h->r60[idx] = ((((base32 >> 16) & 0xFFFFu) + 1u) << 16) | ((base32 >> 16) & 0xFFFFu);
 			h->r6c[idx] = (h->or6c & 0xFFFF0000u) | (((base32 >> 16) & 0xFFFFu) + 1u);
 		} else {
+			/* Slot 0 only encodes bits 31:24 of the aperture. */
 			h->r48[idx] = (h->or48 & ~BIT(5)) | BIT(5);
 			h->r60[idx] = (((base32 >> 16) & 0xFF00u) + 1u) << 16 | ((base32 >> 16) & 0xFF00u);
 			h->r6c[idx] = (h->or6c & 0xFFFFFF00u);
 		}
-	/* If bridge is intel calculate the register values for the bridge window of idx */
+	/* Calculate the register values for an Intel bridge window. */
 	} else if (h->bridge->vendor == IT87_H2_VENDOR_INTEL) {
-			u16 mask = _intel_bios_mask_for_data_space(base32);
-			if (!mask) mask = _intel_bios_mask_for_feat_space(base32);
-			h->r98[idx] = ((base32 >> 16) << 16) | 1u;   /* Generic Memory Range */
-			h->rd8[idx] = h->ord8 & ~(u32)mask;        /* active-low: clear mask bits */
+		u16 mask;
+
+		if (idx == 0) {
+			mask = BIT(0);
+		} else {
+			mask = _intel_bios_mask_for_data_space(base32);
+			if (!mask)
+				mask = _intel_bios_mask_for_feat_space(base32);
 		}
+
+		h->r98[idx] = (base32 & 0xffff0000) | BIT(0);
+		h->rd8[idx] = h->ord8 & ~(u32)mask;
+	} else {
+		return -ENODEV;
+	}
 
 	return 0;
 }
 
+static int it87_h2_prepare_all_slots(struct it87_h2ram_handle *h)
+{
+	int i, ret;
+
+	h->slots_valid = false;
+	for (i = 0; i < ARRAY_SIZE(h->have); i++) {
+		if (!h->have[i])
+			continue;
+
+		ret = it87_h2_prepare_slot_regs(h, i);
+		if (ret)
+			return ret;
+	}
+	h->slots_valid = true;
+
+	return 0;
+}
+
+/* Set up validated MMIO bridge register values without touching hardware. */
+static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
+{
+	struct it87_h2ram_handle old;
+	int ret;
+
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx >= ARRAY_SIZE(h->have))
+		return -EINVAL;
+	if (!mmio_base)
+		return -EINVAL;
+	if (mmio_base > U32_MAX)
+		return -ERANGE;
+	if (mmio_base & 0xffff)
+		return -EINVAL;
+
+	old = *h;
+	h->base[idx] = (u32)mmio_base;
+	h->have[idx] = true;
+
+	ret = it87_h2_prepare_all_slots(h);
+	if (ret)
+		*h = old;
+
+	return ret;
+}
+
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 {
-	if (!h || !h->bridge)return -ENODEV;
-	if (idx<0 || idx>1)return -EINVAL;
-	if (!h->have[idx])return -ENOENT;
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx >= ARRAY_SIZE(h->have))
+		return -EINVAL;
+	if (!h->saved || !h->slots_valid)
+		return -EIO;
+	if (!h->have[idx])
+		return -ENOENT;
 
 	/* Program window on demand for all vendors */
-	if (h->current_base != h->base[idx]) {
+	if (h->current_slot != idx || h->current_base != h->base[idx])
 		return _enable_slot(h, idx);
-	}
+
 	return 0;
 }
 
 static void it87_h2_release(struct it87_h2ram_handle *h)
 {
+	int ret;
+
 	if (!h || !h->bridge)
 		return;
 
-	_restore_regs(h);
+	ret = _restore_regs(h);
+	if (ret)
+		pr_err("failed to restore ISA bridge firmware state: %d; decode left disabled where possible\n",
+		       ret);
 	pci_disable_device(h->bridge);
 	pci_dev_put(h->bridge);
 	memset(h, 0, sizeof(*h));
@@ -1904,19 +2144,40 @@ static void it87_h2_release(struct it87_h2ram_handle *h)
 
 /* ----- Global, locked API for shared MMIO bridge ----- */
 
+static int it87_h2_latch_error(int slot, int err)
+{
+	int latched;
+
+	if (!err)
+		return atomic_read(&it87_h2_global_error);
+	if (err > 0)
+		err = -EIO;
+
+	latched = atomic_cmpxchg(&it87_h2_global_error, 0, err);
+	if (!latched) {
+		pr_err("ISA bridge slot %d programming failed: %d; blocking further bridge-backed writes\n",
+		       slot, err);
+		return err;
+	}
+
+	return latched;
+}
+
 /* Called once from sm_it87_init(), after at least one it87_find()
  * reported a valid mmio_address + mmio_bridge/mmio_h2ram.
  */
 static int it87_h2_global_init(void)
 {
 	int ret;
+
+	atomic_set(&it87_h2_global_error, 0);
 	ret = it87_h2_init(&it87_h2_global);
 	if (!ret)
 		it87_h2_global_ready = true;
 	return ret;
 }
 
-/* Configure a slot (just updates state, does not touch PCI yet) */
+/* Prepare a slot; activation is deferred until the resource-backed probe. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -1929,6 +2190,35 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 	mutex_unlock(&mmio_lock);
 
 	return ret;
+}
+
+static int it87_h2_global_activate_slot(int idx)
+{
+	int ret;
+
+	mutex_lock(&mmio_lock);
+	ret = atomic_read(&it87_h2_global_error);
+	if (!ret && !it87_h2_global_ready)
+		ret = -ENODEV;
+	if (!ret)
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
+	if (ret)
+		ret = it87_h2_latch_error(idx, ret);
+	mutex_unlock(&mmio_lock);
+
+	return ret;
+}
+
+static struct device *it87_h2_global_parent(void)
+{
+	struct device *parent = NULL;
+
+	mutex_lock(&mmio_lock);
+	if (it87_h2_global_ready && it87_h2_global.bridge)
+		parent = &it87_h2_global.bridge->dev;
+	mutex_unlock(&mmio_lock);
+
+	return parent;
 }
 
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
@@ -1946,8 +2236,10 @@ static int it87_h2_global_use_slot(int idx)
 static void it87_h2_global_invalidate(void)
 {
 	mutex_lock(&mmio_lock);
-	if (it87_h2_global_ready)
+	if (it87_h2_global_ready) {
 		it87_h2_global.current_base = 0;
+		it87_h2_global.current_slot = -1;
+	}
 	mutex_unlock(&mmio_lock);
 }
 
@@ -2470,24 +2762,46 @@ static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 	writeb(value, data->mmio + reg);
 }
 
+static bool it87_uses_isa_bridge(const struct it87_data *data)
+{
+	return data->mmio_bridge || data->mmio_h2ram;
+}
+
+static int it87_bridge_fault(const struct it87_data *data)
+{
+	if (!it87_uses_isa_bridge(data))
+		return 0;
+
+	return atomic_read(&it87_h2_global_error);
+}
+
 /* ISA bridge MMIO accessors */
 static int it87_bridge_read(struct it87_data *data, u16 reg)
 {
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		(data->mmio_bridge || data->mmio_h2ram)) {
-		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+		it87_uses_isa_bridge(data)) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
 		int val = 0;
+		int err;
 
+		if (it87_bridge_fault(data))
+			return 0;
 		mutex_lock(&mmio_lock);
-
-		if (it87_h2_global_ready &&
-		    !it87_h2_global_use_slot(slot))
+		err = atomic_read(&it87_h2_global_error);
+		if (!err && !it87_h2_global_ready)
+			err = -ENODEV;
+		if (!err)
+			err = it87_h2_global_use_slot(slot);
+		if (err)
+			it87_h2_latch_error(slot, err);
+		else
 			val = it87_mmio_read(data, reg);
-
 		mutex_unlock(&mmio_lock);
+
 		return val;
 	}
+
 	return 0;
 }
 
@@ -2495,15 +2809,22 @@ static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 {
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		(data->mmio_bridge || data->mmio_h2ram)) {
-		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+		it87_uses_isa_bridge(data)) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+		int err;
 
+		if (it87_bridge_fault(data))
+			return;
 		mutex_lock(&mmio_lock);
-
-		if (it87_h2_global_ready &&
-		    !it87_h2_global_use_slot(slot))
+		err = atomic_read(&it87_h2_global_error);
+		if (!err && !it87_h2_global_ready)
+			err = -ENODEV;
+		if (!err)
+			err = it87_h2_global_use_slot(slot);
+		if (err)
+			it87_h2_latch_error(slot, err);
+		else
 			it87_mmio_write(data, reg, value);
-
 		mutex_unlock(&mmio_lock);
 	}
 }
@@ -2637,7 +2958,7 @@ static void it87_h2ram_set_smartfan(struct it87_data *data, bool enable)
 	int cur = data->read(data, IT87_SMARTFAN_ENABLE);
 	u8 val;
 
-	if (cur < 0)
+	if (cur < 0 || it87_bridge_fault(data))
 		return;
 
 	val = (u8)cur;
@@ -2669,12 +2990,16 @@ static u8 it87_h2ram_override_mask(const struct it87_data *data)
 /* Save the shared SmartFan byte only when software first takes ownership. */
 static void it87_h2ram_take_control(struct it87_data *data)
 {
+	int smartfan;
+
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
 		return;
 
 	if (!data->h2ram_smartfan_orig_valid) {
-		data->h2ram_smartfan_orig =
-			data->read(data, IT87_SMARTFAN_ENABLE);
+		smartfan = data->read(data, IT87_SMARTFAN_ENABLE);
+		if (smartfan < 0 || it87_bridge_fault(data))
+			return;
+		data->h2ram_smartfan_orig = (u8)smartfan;
 		data->h2ram_smartfan_orig_valid = true;
 	}
 
@@ -2689,7 +3014,7 @@ static void it87_h2ram_restore_global_snapshot(struct it87_data *data,
 		return;
 
 	data->write(data, IT87_SMARTFAN_ENABLE, data->h2ram_smartfan_orig);
-	if (release)
+	if (release && !it87_bridge_fault(data))
 		data->h2ram_smartfan_orig_valid = false;
 }
 
@@ -2730,6 +3055,10 @@ static void it87_save_conventional_pwm(struct it87_data *data, int nr)
 		data->fan_shared_saved_mask |= BIT(nr);
 	}
 
+	if (it87_bridge_fault(data)) {
+		data->fan_shared_saved_mask &= ~BIT(nr);
+		return;
+	}
 	data->pwm_state_saved[nr] = true;
 }
 
@@ -2750,18 +3079,18 @@ static void it87_restore_conventional_pwm(struct it87_data *data, int nr,
 		reg &= ~BIT(nr);
 		reg |= data->fan_ctl_saved_bits & BIT(nr);
 		data->write(data, IT87_REG_FAN_CTL, reg);
-		if (release)
+		if (release && !it87_bridge_fault(data))
 			data->fan_ctl = reg;
 
 		reg = data->read(data, IT87_REG_FAN_MAIN_CTRL);
 		reg &= ~BIT(nr);
 		reg |= data->fan_main_ctrl_saved_bits & BIT(nr);
 		data->write(data, IT87_REG_FAN_MAIN_CTRL, reg);
-		if (release)
+		if (release && !it87_bridge_fault(data))
 			data->fan_main_ctrl = reg;
 	}
 
-	if (release) {
+	if (release && !it87_bridge_fault(data)) {
 		data->pwm_ctrl[nr] = data->pwm_ctrl_saved[nr];
 		data->pwm_duty[nr] = data->pwm_duty_saved[nr];
 		data->pwm_state_saved[nr] = false;
@@ -2834,7 +3163,8 @@ static void it87_h2ram_save_vector(struct it87_data *data, int nr)
 				data->read(data, base + 7 + i * 4);
 	}
 
-	data->h2ram_vector_saved[nr] = true;
+	if (!it87_bridge_fault(data))
+		data->h2ram_vector_saved[nr] = true;
 }
 
 static void it87_h2ram_set_manual(struct it87_data *data, int nr, u8 pwm)
@@ -2843,9 +3173,13 @@ static void it87_h2ram_set_manual(struct it87_data *data, int nr, u8 pwm)
 	int i;
 
 	it87_h2ram_save_vector(data, nr);
+	if (it87_bridge_fault(data))
+		return;
 
 	/* G2/G3 direct manual control is performed with SmartFan left on. */
 	it87_h2ram_set_smartfan(data, true);
+	if (it87_bridge_fault(data))
+		return;
 
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
 		/* Move the three extra vectors out of the usable temperature range. */
@@ -2898,7 +3232,7 @@ static void it87_h2ram_restore_vector(struct it87_data *data, int nr,
 	data->write(data, base + 3, data->h2ram_primary_saved[nr][1]);
 	data->write(data, base + 2, data->h2ram_primary_saved[nr][0]);
 
-	if (release)
+	if (release && !it87_bridge_fault(data))
 		data->h2ram_vector_saved[nr] = false;
 }
 
@@ -2916,6 +3250,8 @@ static void it87_disable_extra_vectors(struct it87_data *data, int nr)
 					IT87_EXTVEC_B2_ENABLE(nr, i));
 		data->extvec_saved[nr][3] =
 			data->read(data, IT87_EXTVEC_B3_ENABLE(nr));
+		if (it87_bridge_fault(data))
+			return;
 		data->extvec_enable_saved[nr] = true;
 	}
 
@@ -2941,13 +3277,13 @@ static void it87_restore_extra_vectors(struct it87_data *data, int nr,
 			    data->extvec_saved[nr][i]);
 	data->write(data, IT87_EXTVEC_B3_ENABLE(nr),
 		    data->extvec_saved[nr][3]);
-	if (release)
+	if (release && !it87_bridge_fault(data))
 		data->extvec_enable_saved[nr] = false;
 }
 
 /* Put active software-owned channels back on their exact firmware snapshots. */
-static void it87_restore_overrides_to_firmware(struct it87_data *data,
-						 bool release)
+static int it87_restore_overrides_to_firmware(struct it87_data *data,
+						bool release)
 {
 	u8 mask = data->pwm_override_mask;
 	int i;
@@ -2966,23 +3302,34 @@ static void it87_restore_overrides_to_firmware(struct it87_data *data,
 
 	/* Shared ownership is relinquished only after every channel is restored. */
 	it87_h2ram_restore_global_snapshot(data, release);
-	if (release)
+	if (release && !it87_bridge_fault(data))
 		data->pwm_override_mask = 0;
+
+	return it87_bridge_fault(data);
 }
 
 /* Re-assert the exact software override after a successful system resume. */
-static void it87_reapply_overrides(struct it87_data *data)
+static int it87_reapply_overrides(struct it87_data *data)
 {
 	u8 mask = data->pwm_override_mask;
+	int err;
 	int i;
 
 	if (!mask)
-		return;
+		return 0;
+
+	err = it87_bridge_fault(data);
+	if (err)
+		return err;
 
 	/* G2/G3 must have SmartFan active while their flattened vectors are used. */
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2 ||
-	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3) {
 		it87_h2ram_take_control(data);
+		err = it87_bridge_fault(data);
+		if (err)
+			return err;
+	}
 
 	for (i = 0; i < NUM_PWM; i++) {
 		if (!(mask & BIT(i)))
@@ -2990,19 +3337,34 @@ static void it87_reapply_overrides(struct it87_data *data)
 
 		if (it87_uses_h2ram_vectors(data, i)) {
 			it87_h2ram_set_manual(data, i, data->pwm_override_duty[i]);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 			data->h2ram_pwm_mode[i] = data->pwm_override_mode[i];
 		} else if (it87_uses_conventional_override(data, i)) {
 			it87_apply_conventional_override(data, i,
 						 data->pwm_override_mode[i],
 						 data->pwm_override_duty[i]);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 			it87_disable_extra_vectors(data, i);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 		}
 	}
 
 	/* G1 changes ownership only after its conventional EC state is ready. */
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1 &&
-	    it87_h2ram_override_mask(data))
+	    it87_h2ram_override_mask(data)) {
 		it87_h2ram_take_control(data);
+		err = it87_bridge_fault(data);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -3095,6 +3457,38 @@ static void it87_unlock(struct it87_data *data)
 	mutex_unlock(&data->update_lock);
 }
 
+static int it87_pwm_write_lock(struct it87_data *data)
+{
+	int err;
+
+	err = it87_bridge_fault(data);
+	if (err)
+		return err;
+
+	err = it87_lock(data);
+	if (err)
+		return err;
+
+	err = it87_bridge_fault(data);
+	if (err) {
+		it87_unlock(data);
+		return err;
+	}
+
+	return 0;
+}
+
+static ssize_t it87_pwm_write_finish(struct it87_data *data, ssize_t result)
+{
+	int err = it87_bridge_fault(data);
+
+	if (err)
+		result = err;
+	it87_unlock(data);
+
+	return result;
+}
+
 /*
  * Device-managed teardown runs while the register backend and shared MMIO
  * bridge are still alive.  Restore every software-owned fan channel to the
@@ -3103,11 +3497,14 @@ static void it87_unlock(struct it87_data *data)
 static void it87_restore_firmware_state(void *arg)
 {
 	struct it87_data *data = arg;
+	int bridge_err;
+	int restore_err;
 	int err;
 
 	if (!data->pwm_override_mask)
 		return;
 
+	bridge_err = it87_bridge_fault(data);
 	err = it87_lock(data);
 	if (err) {
 		pr_warn("unable to restore firmware fan state during teardown: %d\n",
@@ -3115,9 +3512,16 @@ static void it87_restore_firmware_state(void *arg)
 		return;
 	}
 
-	it87_restore_overrides_to_firmware(data, true);
+	/* Reachable conventional state is still worth restoring after a fault. */
+	restore_err = it87_restore_overrides_to_firmware(data, !bridge_err);
 	data->suspend_defaults_restored = false;
 	it87_unlock(data);
+
+	if (!bridge_err)
+		bridge_err = restore_err;
+	if (bridge_err)
+		pr_warn("firmware fan-state restoration for Super I/O %#x may be incomplete after ISA bridge error %d\n",
+			data->sioaddr, bridge_err);
 }
 
 static struct it87_data *it87_update_device(struct device *dev)
@@ -3125,10 +3529,20 @@ static struct it87_data *it87_update_device(struct device *dev)
 	struct it87_data *data = dev_get_drvdata(dev);
 	struct it87_data *ret = data;
 	u16 tach_lsb, tach_msb;
+	int bridge_err;
 	int err;
 	int i;
 
+	bridge_err = it87_bridge_fault(data);
+	if (bridge_err)
+		return ERR_PTR(bridge_err);
+
 	mutex_lock(&data->update_lock);
+	bridge_err = it87_bridge_fault(data);
+	if (bridge_err) {
+		ret = ERR_PTR(bridge_err);
+		goto unlock;
+	}
 
 	if (time_after(jiffies, data->last_updated + HZ + HZ / 2) ||
 		       !data->valid) {
@@ -3247,6 +3661,12 @@ static struct it87_data *it87_update_device(struct device *dev)
 		data->last_updated = jiffies;
 		data->valid = true;
 		smbus_enable(data);
+	}
+
+	bridge_err = it87_bridge_fault(data);
+	if (bridge_err) {
+		data->valid = false;
+		ret = ERR_PTR(bridge_err);
 	}
 unlock:
 	mutex_unlock(&data->update_lock);
@@ -3862,26 +4282,35 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 2)
 		return -EINVAL;
 
-	/* Snapshot-backed controllers restore firmware state instead of rebuilding it. */
-	if (val == 2) {
-		if (!it87_uses_h2ram_vectors(data, nr) &&
-		    !it87_uses_conventional_override(data, nr) &&
-		    check_trip_points(dev, nr) < 0)
-			return -EINVAL;
-	}
-
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
 	it87_update_pwm_ctrl(data, nr);
+	err = it87_bridge_fault(data);
+	if (err)
+		return it87_pwm_write_finish(data, err);
+
+	/* Snapshot-backed controllers restore firmware state as their auto mode. */
+	if (val == 2 && !it87_uses_h2ram_vectors(data, nr) &&
+	    !it87_uses_conventional_override(data, nr) &&
+	    check_trip_points(dev, nr) < 0)
+		return it87_pwm_write_finish(data, -EINVAL);
 
 	if (it87_uses_h2ram_vectors(data, nr)) {
 		if (val == 2) {
 			it87_h2ram_restore_vector(data, nr, true);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 			data->h2ram_pwm_mode[nr] = 2;
 			data->pwm_override_mask &= ~BIT(nr);
 			it87_h2ram_release_control_if_idle(data);
+			err = it87_bridge_fault(data);
+			if (err) {
+				data->pwm_override_mask |= BIT(nr);
+				return it87_pwm_write_finish(data, err);
+			}
 		} else {
 			if (val == 0) {
 				pwm = pwm_to_reg(data, 0xff);
@@ -3899,15 +4328,20 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			} else {
 				pwm = data->pwm_duty[nr];
 			}
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 			data->pwm_override_mask |= BIT(nr);
 			data->pwm_override_mode[nr] = val;
 			data->pwm_override_duty[nr] = pwm;
 			it87_h2ram_take_control(data);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 			it87_h2ram_set_manual(data, nr, pwm);
 			data->h2ram_pwm_mode[nr] = val;
 		}
-		it87_unlock(data);
-		return count;
+		return it87_pwm_write_finish(data, count);
 	}
 
 	if (it87_uses_conventional_override(data, nr)) {
@@ -3915,26 +4349,45 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 			it87_restore_conventional_pwm(data, nr, true);
 			/* Extra vectors are enabled only after the primary state is safe. */
 			it87_restore_extra_vectors(data, nr, true);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 			data->pwm_override_mask &= ~BIT(nr);
-			if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
+			if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1) {
 				it87_h2ram_release_control_if_idle(data);
+				err = it87_bridge_fault(data);
+				if (err) {
+					data->pwm_override_mask |= BIT(nr);
+					return it87_pwm_write_finish(data, err);
+				}
+			}
 		} else {
 			it87_save_conventional_pwm(data, nr);
-			it87_disable_extra_vectors(data, nr);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 
-			pwm = val == 0 ? pwm_to_reg(data, 0xff) : data->pwm_duty[nr];
 			data->pwm_override_mask |= BIT(nr);
 			data->pwm_override_mode[nr] = val;
-			data->pwm_override_duty[nr] = pwm;
+			data->pwm_override_duty[nr] =
+				val == 0 ? pwm_to_reg(data, 0xff) : data->pwm_duty[nr];
+			it87_disable_extra_vectors(data, nr);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
+
+			pwm = data->pwm_override_duty[nr];
 			it87_apply_conventional_override(data, nr, val, pwm);
+			err = it87_bridge_fault(data);
+			if (err)
+				return it87_pwm_write_finish(data, err);
 
 			/* G1 changes 0x947 only after its EC override is programmed. */
 			if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
 				it87_h2ram_take_control(data);
 		}
 
-		it87_unlock(data);
-		return count;
+		return it87_pwm_write_finish(data, count);
 	}
 
 	if (val == 0) {
@@ -3989,8 +4442,7 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		}
 	}
 
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
@@ -3999,19 +4451,20 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 	struct sensor_device_attribute *sensor_attr = to_sensor_dev_attr(attr);
 	struct it87_data *data = dev_get_drvdata(dev);
 	int nr = sensor_attr->index;
+	ssize_t result = count;
 	long val;
 	int err;
 
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
 	if (it87_uses_h2ram_vectors(data, nr)) {
 		if (data->h2ram_pwm_mode[nr] != 1) {
-			count = -EBUSY;
+			result = -EBUSY;
 			goto unlock;
 		}
 
@@ -4025,7 +4478,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 	if (it87_uses_conventional_override(data, nr) &&
 	    (data->pwm_override_mask & BIT(nr))) {
 		if (data->pwm_override_mode[nr] != 1) {
-			count = -EBUSY;
+			result = -EBUSY;
 			goto unlock;
 		}
 
@@ -4042,7 +4495,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 		 * is read-only so we can't write the value.
 		 */
 		if (data->pwm_ctrl[nr] & 0x80) {
-			count = -EBUSY;
+			result = -EBUSY;
 			goto unlock;
 		}
 		data->pwm_duty[nr] = pwm_to_reg(data, val);
@@ -4061,8 +4514,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 		}
 	}
 unlock:
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, result);
 }
 
 static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
@@ -4087,7 +4539,7 @@ static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
 			break;
 	}
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
@@ -4100,8 +4552,7 @@ static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
 		data->extra |= i << 4;
 		data->write(data, IT87_REG_TEMP_EXTRA, data->extra);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static ssize_t show_pwm_temp_map(struct device *dev,
@@ -4136,11 +4587,14 @@ static ssize_t set_pwm_temp_map(struct device *dev,
 
 	map = val - 1;
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
 	it87_update_pwm_ctrl(data, nr);
+	err = it87_bridge_fault(data);
+	if (err)
+		return it87_pwm_write_finish(data, err);
 	data->pwm_temp_map[nr] = map;
 	/*
 	 * If we are in automatic mode, write the temp mapping immediately;
@@ -4150,8 +4604,7 @@ static ssize_t set_pwm_temp_map(struct device *dev,
 		data->pwm_ctrl[nr] = temp_map_to_reg(data, nr, map);
 		data->write(data, data->REG_PWM[nr], data->pwm_ctrl[nr]);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static ssize_t show_auto_pwm(struct device *dev, struct device_attribute *attr,
@@ -4185,7 +4638,7 @@ static ssize_t set_auto_pwm(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
@@ -4195,8 +4648,7 @@ static ssize_t set_auto_pwm(struct device *dev, struct device_attribute *attr,
 	else
 		regaddr = IT87_REG_AUTO_PWM(nr, point);
 	data->write(data, regaddr, data->auto_pwm[nr][point]);
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static ssize_t show_auto_pwm_slope(struct device *dev,
@@ -4225,14 +4677,13 @@ static ssize_t set_auto_pwm_slope(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0 || val > 127)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
 	data->auto_pwm[nr][1] = (data->auto_pwm[nr][1] & 0x80) | val;
 	data->write(data, IT87_REG_AUTO_TEMP(nr, 4), data->auto_pwm[nr][1]);
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static ssize_t show_auto_temp(struct device *dev, struct device_attribute *attr,
@@ -4271,7 +4722,7 @@ static ssize_t set_auto_temp(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < -128000 || val > 127000)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_write_lock(data);
 	if (err)
 		return err;
 
@@ -4287,8 +4738,7 @@ static ssize_t set_auto_temp(struct device *dev, struct device_attribute *attr,
 			point--;
 		data->write(data, IT87_REG_AUTO_TEMP(nr, point), reg);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_write_finish(data, count);
 }
 
 static SENSOR_DEVICE_ATTR_2(fan1_input, S_IRUGO, show_fan, NULL, 0, 0);
@@ -6475,6 +6925,37 @@ static int it87_check_pwm(struct device *dev)
 	return 1;
 }
 
+static int it87_request_io_resource(struct device *dev,
+				    struct resource *res, const char *name,
+				    bool check_acpi_conflict)
+{
+	int err;
+
+	if (!res) {
+		dev_err(dev, "%s resource is unavailable\n", name);
+		return -ENODEV;
+	}
+
+	if (check_acpi_conflict) {
+		err = acpi_check_resource_conflict(res);
+		if (err) {
+			if (dmi_data && dmi_data->skip_acpi_res)
+				dev_info(dev,
+					 "Ignoring expected ACPI resource conflict for %s\n",
+					 name);
+			else if (!ignore_resource_conflict)
+				return err;
+		}
+	}
+
+	if (!devm_request_region(dev, res->start, resource_size(res), DRVNAME)) {
+		dev_err(dev, "Failed to request %s region %pR\n", name, res);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 static int it87_probe(struct platform_device *pdev)
 {
 	struct it87_data      *data;
@@ -6485,6 +6966,8 @@ static int it87_probe(struct platform_device *pdev)
 	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
 	int                    enable_pwm_interface;
 	struct device         *hwmon_dev;
+	bool                   io_requested = false;
+	int                    mmio_err = 0;
 	int                    err;
 
 	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
@@ -6498,43 +6981,26 @@ static int it87_probe(struct platform_device *pdev)
      *   IORESOURCE_MEM index 0: MMIO/H2RAM window
      */
 
-	/* Primary EC I/O window (always present) */
+	/* Primary EC I/O window, including the MMIO fallback path */
 	res_io = platform_get_resource(pdev, IORESOURCE_IO, 0);
-	if (res_io) {
-		if (!devm_request_region(dev, res_io->start, IT87_EC_EXTENT,
-					 DRVNAME)) {
-			dev_err(dev, "Failed to request Conventional IO region %pR\n", res_io);
-			return -EBUSY;
-		}
-	}
-
-	/* Extended EC I/O window */
 	res_ecio = platform_get_resource(pdev, IORESOURCE_IO, 1);
-	if (res_ecio) {
-		if (!devm_request_region(dev, res_ecio->start, EXT_ECIO_EXTENT,
-					 DRVNAME)) {
-			dev_err(dev, "Failed to request Extended ECIO region %pR\n", res_ecio);
-			return -EBUSY;
-		}
-	}
 
-	/* Map Memory resources for MMIO */
+	/* Map the preferred MMIO transport before claiming an optional fallback. */
 	res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (res_mmio)
-	{
+	if (res_mmio) {
 		data->mmio = devm_ioremap_resource(dev, res_mmio);
-		if (IS_ERR(data->mmio))
-			return PTR_ERR(data->mmio);
-	}
-	else
-	{
+		if (IS_ERR(data->mmio)) {
+			mmio_err = PTR_ERR(data->mmio);
+			data->mmio = NULL;
+		}
+	} else {
 		data->mmio = NULL;
 	}
 
-	if(res_io)
+	if (res_io)
 		data->addr = res_io->start;
 	else
-		data->addr = 0;    /* no conventional EC I/O available */
+		data->addr = 0;
 	data->type              = sio_data->type;
 	data->revision          = sio_data->revision;
 	data->sioaddr           = sio_data->sioaddr;
@@ -6546,9 +7012,40 @@ static int it87_probe(struct platform_device *pdev)
 	data->pwm_num_temp_map  = it87_devices[sio_data->type].num_temp_map;
 	data->peci_mask         = it87_devices[sio_data->type].peci_mask;
 	data->old_peci_mask     = it87_devices[sio_data->type].old_peci_mask;
-	data->mmio_bridge       = sio_data->mmio_bridge;
-	data->mmio_h2ram        = sio_data->mmio_h2ram;
+	data->mmio_bridge       = data->mmio && sio_data->mmio_bridge;
+	data->mmio_h2ram        = data->mmio && sio_data->mmio_h2ram;
 	data->ecio_h2ram        = sio_data->ecio_h2ram;
+
+	/*
+	 * Conventional I/O is the primary transport without MMIO and supplies
+	 * the low half of both H2RAM hybrid transports.
+	 */
+	if (!data->mmio || data->mmio_h2ram || data->ecio_h2ram) {
+		err = it87_request_io_resource(dev, res_io,
+					       "conventional I/O",
+					       sio_data->mmio ||
+					       sio_data->mmio_bridge);
+		if (err) {
+			if (mmio_err)
+				dev_err(dev,
+					 "MMIO mapping failed (%d) and conventional I/O fallback failed (%d)\n",
+					 mmio_err, err);
+			return err;
+		}
+		io_requested = true;
+		if (mmio_err)
+			dev_warn(dev,
+				 "MMIO mapping failed (%d), using conventional I/O\n",
+				 mmio_err);
+	}
+
+	/* Extended EC I/O window */
+	if (res_ecio) {
+		err = it87_request_io_resource(dev, res_ecio, "extended ECIO",
+					       false);
+		if (err)
+			return err;
+	}
 
 	switch(data->type)
 	{
@@ -6574,7 +7071,42 @@ static int it87_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, data);
 	mutex_init(&data->update_lock);
 
-	/* Initialize register accessors (select IO vs MMIO backend) */
+	/*
+	 * Activate a validated forwarding slot before selecting MMIO accessors.
+	 * If activation fails, stop using the mapping and retry initialization
+	 * through the conventional I/O resource when it is available.
+	 */
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_activate_slot(slot);
+		if (err) {
+			int bridge_err = err;
+
+			if (!io_requested) {
+				err = it87_request_io_resource(dev, res_io,
+							      "conventional I/O",
+							      true);
+				if (err) {
+					dev_err(dev,
+						"ISA bridge activation failed (%d) and conventional I/O fallback failed (%d)\n",
+						bridge_err, err);
+					return bridge_err;
+				}
+				io_requested = true;
+			}
+
+			dev_warn(dev,
+				 "ISA bridge activation failed (%d), using conventional I/O\n",
+				 bridge_err);
+			/* The unused mapping remains devres-managed until teardown. */
+			data->mmio = NULL;
+			data->mmio_bridge = false;
+			data->mmio_h2ram = false;
+		}
+	}
+
+	/* Initialize register accessors after the final transport is known. */
 	it87_init_regs(pdev);
 
 	/* Disable SMBus shadowing while probing sensor blocks */
@@ -6592,6 +7124,11 @@ static int it87_probe(struct platform_device *pdev)
 	it87_detect_h2ram_smartfan(dev, data);
 
 	enable_pwm_interface = it87_check_pwm(dev);
+	err = it87_bridge_fault(data);
+	if (err) {
+		smbus_enable(data);
+		return err;
+	}
 	if (!enable_pwm_interface)
 		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
 
@@ -6665,7 +7202,13 @@ static int it87_probe(struct platform_device *pdev)
 		data->has_fan |= (BIT(data->it57xx_fans) - 1)
 				 << IT87_H2RAM_BASE_FANS;
 
+	err = it87_bridge_fault(data);
 	smbus_enable(data);
+	if (err) {
+		dev_err(dev, "ISA bridge access failed during controller initialization: %d\n",
+			err);
+		return err;
+	}
 
 	if (!sio_data->skip_vid)
 	{
@@ -6707,7 +7250,11 @@ static int it87_probe(struct platform_device *pdev)
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
 			     it87_devices[sio_data->type].name,
 			     data, data->groups);
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+	if (IS_ERR(hwmon_dev))
+		return PTR_ERR(hwmon_dev);
+
+	data->probe_complete = true;
+	return 0;
 }
 
 static void it87_resume_sio(struct platform_device *pdev)
@@ -6745,6 +7292,7 @@ static void it87_resume_sio(struct platform_device *pdev)
 static int it87_suspend(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
+	int restore_err;
 	int err;
 
 	err = it87_lock(data);
@@ -6757,19 +7305,28 @@ static int it87_suspend(struct device *dev)
 		 * desired software values in memory so a successful resume can retake
 		 * control without changing what "automatic" means.
 		 */
-		it87_restore_overrides_to_firmware(data, false);
-		data->suspend_defaults_restored = true;
+		err = it87_bridge_fault(data);
+		restore_err = it87_restore_overrides_to_firmware(data, false);
+		if (!err)
+			err = restore_err;
+		if (!err)
+			data->suspend_defaults_restored = true;
+		else
+			dev_err(dev,
+				"unable to verify firmware fan-state restoration: %d\n",
+				err);
 		data->valid = false;
 	}
 
 	it87_unlock(data);
-	return 0;
+	return err;
 }
 
 static int it87_resume(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct it87_data *data = dev_get_drvdata(dev);
+	struct it87_data *updated;
 	int err;
 	int pwm_safe;
 
@@ -6782,15 +7339,44 @@ static int it87_resume(struct device *dev)
 	if (err)
 		return err;
 
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	pwm_safe = it87_check_pwm(dev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_limit_regs(data);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_voltage_monitors_reset(data);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_tachometers_reset(pdev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_tachometers_16bit_mode(pdev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
 
 	/* Only a sane resume that reached this point retakes software ownership. */
 	if (data->suspend_defaults_restored && pwm_safe) {
-		it87_reapply_overrides(data);
+		err = it87_reapply_overrides(data);
+		if (err) {
+			dev_err(dev,
+				"unable to reapply software fan control: %d\n",
+				err);
+			goto out_unlock;
+		}
 		data->suspend_defaults_restored = false;
 	} else if (data->suspend_defaults_restored) {
 		dev_warn(dev,
@@ -6798,13 +7384,19 @@ static int it87_resume(struct device *dev)
 	}
 
 	it87_start_monitoring(data);
+	err = it87_bridge_fault(data);
 
+out_unlock:
 	/* force update */
 	data->valid = false;
 
 	it87_unlock(data);
+	if (err)
+		return err;
 
-	it87_update_device(dev);
+	updated = it87_update_device(dev);
+	if (IS_ERR(updated))
+		return PTR_ERR(updated);
 
 	return 0;
 }
@@ -6815,9 +7407,24 @@ static struct platform_driver it87_driver = {
 	.driver = {
 		.name	= DRVNAME,
 		.pm	= pm_sleep_ptr(&it87_dev_pm_ops),
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
 	.probe	= it87_probe,
 };
+
+static bool it87_probe_completed(struct platform_device *pdev)
+{
+	struct it87_data *data;
+	bool complete;
+
+	device_lock(&pdev->dev);
+	data = platform_get_drvdata(pdev);
+	complete = pdev->dev.driver == &it87_driver.driver && data &&
+		   data->probe_complete;
+	device_unlock(&pdev->dev);
+
+	return complete;
+}
 
 static int __init it87_device_add(int index, unsigned short sio_address,
 				  phys_addr_t mmio_address,
@@ -6830,7 +7437,7 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 
 	memset(res, 0, sizeof(res));
 
-	/* Only allocate IO Ports if we don't use MMIO */
+	/* Allocate I/O ports for I/O users and as an unclaimed MMIO fallback. */
 	if (!((sio_data->mmio_bridge || sio_data->mmio) && mmio_address)) {
 		/*
 		* 1) Primary EC I/O window (If enabled, ACPI-checked)
@@ -6873,6 +7480,12 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 
 			nres++;
 		}
+	} else {
+		res[nres].name  = DRVNAME;
+		res[nres].start = sio_address + IT87_EC_OFFSET;
+		res[nres].end   = sio_address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1;
+		res[nres].flags = IORESOURCE_IO;
+		nres++;
 	}
 
 	/* Secondary MMIO Resource*/
@@ -6881,8 +7494,16 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		phys_addr_t start = mmio_address;
 		phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
-		/* H2RAM chips have an extra EC/HWM block mapped into the window
-	 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
+		/*
+		 * The chipset's 64 KiB decode is a forwarding aperture, not
+		 * exclusive IT87 ownership.  Reserve only the IT87 register
+		 * subrange modeled by this child.
+		 */
+
+		/*
+		 * H2RAM chips have an extra EC/HWM block mapped into the window
+		 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF.
+		 */
 		if (sio_data->mmio_h2ram)
 		{
 			start = mmio_address;
@@ -6899,6 +7520,14 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 	pdev = platform_device_alloc(DRVNAME, sio_address);
 	if (!pdev)
 		return -ENOMEM;
+
+	if (sio_data->mmio_bridge || sio_data->mmio_h2ram) {
+		pdev->dev.parent = it87_h2_global_parent();
+		if (!pdev->dev.parent) {
+			err = -ENODEV;
+			goto exit_device_put;
+		}
+	}
 
 	err = platform_device_add_resources(pdev, res, nres);
 	if (err)
@@ -6921,10 +7550,19 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
+	/* Never retain an unbound, incompletely validated device. */
+	if (!it87_probe_completed(pdev)) {
+		pr_err("Device probe failed for Super I/O at %#x\n",
+		       sio_address);
+		err = -ENODEV;
+		goto exit_device_del;
+	}
 
 	it87_pdev[index] = pdev;
 	return 0;
 
+exit_device_del:
+	platform_device_del(pdev);
 exit_device_put:
 	platform_device_put(pdev);
 	return err;
@@ -7142,29 +7780,32 @@ static int __init sm_it87_init(void)
 	 * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
 	 * the global H2 manager slot for it.
 	 */
-		if (mmio_address &&
-	   (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
+		if (sio_data.mmio_bridge || sio_data.mmio_h2ram) {
 			phys_addr_t base = mmio_address;
 			int         slot;
-			int         ret;
+			int         ret = 0;
 
-			if (!it87_h2_global_inited) {
+			if (!base)
+				ret = -EINVAL;
+			if (!ret && !it87_h2_global_inited) {
 				ret = it87_h2_global_init();
-				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
-				} else {
+				if (!ret)
 					it87_h2_global_inited = true;
-				}
 			}
-			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
-				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
+			if (!ret && !it87_h2_global_ready)
+				ret = -ENODEV;
+
+			/* slot 0 = 0x2E, slot 1 = 0x4E */
+			slot = sioaddr[i] == REG_4E ? 1 : 0;
+			if (!ret)
 				ret = it87_h2_global_set_slot(slot, base);
-				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
-				}
+			if (ret) {
+				pr_warn("ISA bridge MMIO setup failed for Super I/O %#x at %pa (%d), using conventional I/O\n",
+					sioaddr[i], &base, ret);
+				sio_data.mmio = false;
+				sio_data.mmio_bridge = false;
+				sio_data.mmio_h2ram = false;
+				mmio_address = 0;
 			}
 		}
 
@@ -7181,6 +7822,7 @@ static int __init sm_it87_init(void)
 	return 0;
 
 exit_unregister:
+	/* Child devres restores firmware fan state before bridge release. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
@@ -7197,6 +7839,7 @@ exit_unregister:
 }
 
 static void __exit sm_it87_exit(void) {
+	/* Unregister children before restoring and releasing the shared bridge. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
