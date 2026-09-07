@@ -75,7 +75,9 @@ all: modules
 
 # Targets for running make directly in the external module directory:
 
+# EXTRA_CFLAGS is now deprecated - but this should work on both old and new
 IT87_CFLAGS=-DIT87_DRIVER_VERSION='\"$(DRIVER_VERSION)\"'
+ccflags-y += -DIT87_DRIVER_VERSION=\"$(DRIVER_VERSION)\"
 
 modules:
 	@$(MAKE) EXTRA_CFLAGS="$(IT87_CFLAGS)" -C $(KERNEL_BUILD) M=$(CURDIR) $@
