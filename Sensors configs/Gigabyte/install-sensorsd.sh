@@ -2,7 +2,7 @@
 set -eu
 
 SRC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CATALOG_DIR="$SRC_DIR/catalog"
+CATALOG_DIR="$SRC_DIR/configs"
 DEST_DIR="/etc/sensors.d"
 VENDOR="auto"
 X299_VARIANT="auto"
