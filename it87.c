@@ -298,6 +298,15 @@ static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 #define IT87_SIO_PINX2_REG	0x2c	/* Pin selection */
 #define IT87_SIO_PINX4_REG	0x2d	/* Pin selection */
 
+/*
+ * Gigabyte IT879x noise meter: GPIO LDN7 PINX2 bit 0 selects the
+ * internal VIN3 divider. Clear it to route the external VIN3 pin.
+ */
+#define IT87_GIGABYTE_NOISE_INTERNAL_BIT	BIT(0)
+#define IT87_GIGABYTE_NOISE_VIN		3
+#define IT87_GIGABYTE_NOISE_ADC_MV	11
+#define IT87_GIGABYTE_NOISE_CUTOFF_MV	100
+
 /* Logical device 7 (GPIO) registers (IT8712F and later) */
 #define IT87_SIO_SPI_REG	0xef	/* SPI function pin select */
 #define IT87_SIO_VID_REG	0xfc	/* VID value */
@@ -1049,7 +1058,7 @@ struct it87_sio_data {
  * The structure is dynamically allocated.
  */
 struct it87_data {
-	const struct attribute_group *groups[7];
+	const struct attribute_group *groups[8];
 	enum chips type;
 	u64 features;
 	u8 revision;
@@ -1166,6 +1175,11 @@ struct it87_data {
 	/* Automatic fan speed control registers */
 	u8 auto_pwm[NUM_AUTO_PWM][4];	/* [nr][3] is hard-coded */
 	s8 auto_temp[NUM_AUTO_PWM][5];	/* [nr][0] is point1_temp_hyst */
+
+	/* Gigabyte IT879x VIN3 noise meter state. */
+	bool has_noise;
+	bool noise_pin_saved;
+	u8 noise_pin_reg;
 };
 
 struct gigabyte_smi_regs {
@@ -1197,15 +1211,15 @@ static const struct dmi_system_id gigabyte_dmi_table[] = {
 	{ }
 };
 
-/* Parsed SIV/MGID description */
-struct gbw_mgid_info {
-	u32 group;        /* raw 32-bit MGID (low 32 bits) */
+/* Parsed SIV description */
+struct gbw_siv_info {
+	u32 siv;          /* raw 32-bit SIV (low 32 bits) */
 	u8  platform;     /* bits 31:28 */
 	u8  special;      /* bits 27:24 */
 	u8  fan_count;    /* bits 20:16 */
 	u8  temp_count;   /* bits 12:8  */
 	u8  volt_count;   /* bits 4:0   */
-	bool supported;   /* platform != 0 and group != 0 */
+	bool supported;   /* platform != 0 and siv != 0 */
 };
 
 static int gigabyte_smi_call(struct gigabyte_smi_regs *regs)
@@ -1277,37 +1291,37 @@ static int gbw_siv(u32 *siv)
 	return 0;
 }
 
-/* Parse low 32-bit MGID/SIV into fields */
-static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
+/* Parse low 32-bit SIV into fields */
+static int gbw_parse_siv(u32 siv, struct gbw_siv_info *out)
 {
 	if (!out)
 		return -EINVAL;
 
 	memset(out, 0, sizeof(*out));
-	out->group = mgid;
-	if (mgid == 0)
+	out->siv = siv;
+	if (siv == 0)
 		return -ENODEV;
 
-	out->platform = (mgid >> 28) & 0xF;
+	out->platform = (siv >> 28) & 0xF;
 	if (out->platform == 0)
 		return -ENODEV;
 
-	out->special    = (mgid >> 24) & 0xF;
-	out->fan_count  = (mgid >> 16) & 0x1F;
-	out->temp_count = (mgid >>  8) & 0x1F;
-	out->volt_count =  mgid        & 0x1F;
+	out->special    = (siv >> 24) & 0xF;
+	out->fan_count  = (siv >> 16) & 0x1F;
+	out->temp_count = (siv >>  8) & 0x1F;
+	out->volt_count =  siv         & 0x1F;
 	out->supported  = true;
 	return 0;
 }
 
 /* Read the cached SIV and parse it. */
-static int gbw_read_siv_info(struct gbw_mgid_info *out)
+static int gbw_read_siv_info(struct gbw_siv_info *out)
 {
-	u32 mgid;
-	int ret = gbw_siv(&mgid);
+	u32 siv;
+	int ret = gbw_siv(&siv);
 	if (ret)
 		return ret;
-	return gbw_parse_mgid(mgid, out);
+	return gbw_parse_siv(siv, out);
 }
 
 /*
@@ -1317,15 +1331,181 @@ static int gbw_read_siv_info(struct gbw_mgid_info *out)
  */
 static bool gigabyte_platform_valid(void)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 
 	return gigabyte_dmi_valid && !gbw_read_siv_info(&info) && info.supported;
 }
 
-/* Convenience getters for individual SIV/MGID fields */
+/*
+ * Gigabyte board-placement data explicitly marks the SIVs below as having
+ * one "Noise Level" input routed through IT879x VIN3. Keep the AMD and Intel
+ * sets separate because some numeric SIVs occur in both vendor families.
+ */
+static bool gigabyte_noise_siv_supported(u32 siv)
+{
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+		switch (siv) {
+		case 0x4308090b:
+		case 0x4208090b:
+		case 0x4108090b:
+		case 0x4008090a:
+		case 0x6108090b:
+		case 0x800a090a:
+		case 0x8108090a:
+		case 0x5108090b:
+		case 0x5208090b:
+		case 0x5308090a:
+		case 0x9a0a0908:
+		case 0x9a0b0908:
+		case 0x910a0909:
+		case 0x900a0909:
+		case 0x90090909:
+		case 0x90080909:
+		case 0xa00c090a:
+		case 0xa00c0908:
+		case 0xa00b090a:
+		case 0xa00a090a:
+		case 0xa10a090a:
+		case 0xa20a090a:
+		case 0xa00a0908:
+		case 0xa008090a:
+		case 0xa108090a:
+		case 0xa208090a:
+		case 0xa308090a:
+		case 0xa0080908:
+		case 0xa3080908:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
+		switch (siv) {
+		case 0x5008090a:
+		case 0x5108090a:
+		case 0x6108090a:
+		case 0x6208090b:
+		case 0x6508090b:
+		case 0x710a090a:
+		case 0x710a090b:
+		case 0x720a090b:
+		case 0x730a090b:
+		case 0x7108090b:
+		case 0x7208090b:
+		case 0x7308090b:
+		case 0x7106090b:
+		case 0x800a0909:
+		case 0x800a090a:
+		case 0x810a090a:
+		case 0x8008090a:
+		case 0x8108090a:
+		case 0x8008090b:
+		case 0x900a0909:
+		case 0x910a090a:
+		case 0x900a090a:
+		case 0x9108090a:
+		case 0x9008090a:
+		case 0x9008090b:
+		case 0xa00b090b:
+		case 0xa00a090b:
+		case 0xa10a090b:
+		case 0xa009090b:
+		case 0xa008090b:
+		case 0xa108090b:
+		case 0xa00a080b:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	return false;
+}
+
+static bool it87_gigabyte_noise_supported(const struct it87_data *data)
+{
+	u32 siv;
+
+	/* Reject unsupported boards before any noise-specific Super I/O work. */
+	if (!gigabyte_dmi_valid || !gigabyte_siv_valid)
+		return false;
+
+	siv = gigabyte_siv;
+	if (!gigabyte_noise_siv_supported(siv))
+		return false;
+
+	if (data->sioaddr != REG_4E)
+		return false;
+
+	switch (data->type) {
+	case it8790:
+	case it8792:
+	case it87952:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int it87_configure_gigabyte_noise_input(struct it87_data *data)
+{
+	u8 reg;
+	int err;
+
+	if (!data->has_noise)
+		return 0;
+
+	err = superio_enter(data->sioaddr, has_noconf(data));
+	if (err)
+		return err;
+
+	superio_select(data->sioaddr, GPIO);
+	reg = superio_inb(data->sioaddr, IT87_SIO_PINX2_REG);
+
+	if (!data->noise_pin_saved) {
+		data->noise_pin_reg = reg;
+		data->noise_pin_saved = true;
+	}
+
+	/* Clear bit 0: VIN3 external-voltage input, matching the vendor meter. */
+	if (reg & IT87_GIGABYTE_NOISE_INTERNAL_BIT)
+		superio_outb(data->sioaddr, IT87_SIO_PINX2_REG,
+			     reg & ~IT87_GIGABYTE_NOISE_INTERNAL_BIT);
+
+	superio_exit(data->sioaddr, has_noconf(data));
+	return 0;
+}
+
+static int it87_restore_gigabyte_noise_input(struct it87_data *data)
+{
+	u8 reg, restored;
+	int err;
+
+	if (!data->noise_pin_saved)
+		return 0;
+
+	err = superio_enter(data->sioaddr, has_noconf(data));
+	if (err)
+		return err;
+
+	superio_select(data->sioaddr, GPIO);
+	reg = superio_inb(data->sioaddr, IT87_SIO_PINX2_REG);
+	restored = (reg & ~IT87_GIGABYTE_NOISE_INTERNAL_BIT) |
+		   (data->noise_pin_reg & IT87_GIGABYTE_NOISE_INTERNAL_BIT);
+
+	if (restored != reg)
+		superio_outb(data->sioaddr, IT87_SIO_PINX2_REG, restored);
+
+	superio_exit(data->sioaddr, has_noconf(data));
+	data->noise_pin_saved = false;
+	return 0;
+}
+
+/* Convenience getters for individual SIV fields */
 static int gbw_siv_platform_id(u8 *platform)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1335,7 +1515,7 @@ static int gbw_siv_platform_id(u8 *platform)
 
 static int gbw_siv_fan_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1346,7 +1526,7 @@ static int gbw_siv_fan_count(u8 *count)
 #ifdef IT87_FUTURE_USE
 static int gbw_siv_temp_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1358,7 +1538,7 @@ static int gbw_siv_temp_count(u8 *count)
 #ifdef IT87_FUTURE_USE
 static int gbw_siv_volt_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1430,21 +1610,6 @@ enum it87_isabridge_type {
 
 /* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
-/* Helpers for Intel type bridges */
-static inline void it87_hidden_cleanup(struct pci_dev *pch_f0,
-									   struct pci_dev *pch_f1,
-									   bool e1_changed)
-{
-	if (pch_f1 && e1_changed) {
-		pci_write_config_byte(pch_f1, 0xE1, 0xFF);
-		msleep(1);
-	}
-	if (pch_f1)
-		pci_dev_put(pch_f1);
-	if (pch_f0)
-		pci_dev_put(pch_f0);
-}
-
 /* checks for compatible skylake bridges */
 static bool cpu_is_skl_kbl_cfl_family(void)
 {
@@ -1476,11 +1641,12 @@ static bool cpu_is_skl_kbl_cfl_family(void)
  * into 'h'. For generic Intel (no hidden window), marks hidden_ready=false. */
 static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 {
-	struct pci_dev *pch_f0 = NULL, *pch_f1 = NULL;
+	struct pci_bus *bus;
+	unsigned int pch_f1 = PCI_DEVFN(0x1f, 1);
 	u32 bar0 = 0;
 	u8 e1 = 0;
 	bool e1_changed = false;
-	int ret;
+	int ret = 0;
 	u32 hidden_ofs = 0;
 	u8 platform = 0;
 	int siv_ret;
@@ -1490,7 +1656,11 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 
 	h->hidden_ready = false;
 
-	/* Decide Intel ISA bridge kind and hidden offset */
+	/*
+	 * Select the PCR port ID used by this PCH generation.  Platform IDs
+	 * 4 and 6 use the newer DMI port; earlier client generations use the
+	 * Skylake-family DMI port.  Other Intel bridges need no PCR mirror.
+	 */
 	siv_ret = gbw_siv_platform_id(&platform);
 	if (siv_ret == 0 && (platform == 4 || platform == 6)) {
 		h->intel_isabridge_type = IT87_ISA_INTEL_Z390;
@@ -1504,50 +1674,68 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		h->hidden_ready = false;
 		return 0;
 	}
-	/* Compute/capture hidden base using chosen hidden_ofs */
-	pch_f0 = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 0));
-	if (!pch_f0)
-		return -ENODEV;
 
-	pch_f1 = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 1));
-	if (!pch_f1) {
-		/* If hidden function is not present, allow Z390 fallback base */
-		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
-			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
-			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, NULL, false);
-			return 0;
-		}
-		it87_hidden_cleanup(pch_f0, NULL, false);
-		return -ENODEV;
-		}
+	/*
+	 * Address P2SB through the root bus config-space operations.  P2SB is
+	 * normally hidden before PCI enumeration, so looking it up as a normal
+	 * pci_dev would fail even though its configuration space still responds.
+	 */
+	bus = pci_find_bus(0, 0);
+	if (!bus)
+		goto fallback;
 
-	ret = pci_read_config_byte(pch_f1, 0xE1, &e1);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+	/* Save the function-hide control so visibility can be restored exactly. */
+	ret = pci_bus_read_config_byte(bus, pch_f1, 0xE1, &e1);
+	if (ret)
+		goto fallback;
 	if (e1 != 0x10) {
-		ret = pci_write_config_byte(pch_f1, 0xE1, 0x10);
-		if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
-		msleep(1);
+		/* Clear the hide state while retaining the required control bits. */
+		ret = pci_bus_write_config_byte(bus, pch_f1, 0xE1, 0x10);
+		if (ret)
+			return -EIO;
+		usleep_range(1000, 2000);
 		e1_changed = true;
 	}
 
-	ret = pci_read_config_dword(pch_f1, 0x10, &bar0);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, e1_changed); return ret; }
+	/* BAR0 supplies the base of the PCH private sideband register aperture. */
+	ret = pci_bus_read_config_dword(bus, pch_f1, 0x10, &bar0);
+	if (ret) {
+		ret = -EIO;
+		goto restore_e1;
+	}
 	if (!bar0 || bar0 == 0xFFFFFFFFu) {
-		/* BAR0 unavailable: apply Z390 fixed base fallback when requested */
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-			return 0;
+			goto restore_e1;
 		}
-		it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-		return -EIO;
+		ret = -ENODEV;
+		goto restore_e1;
 	}
+	/* Add the generation-specific DMI PCR port and register-block offset. */
 	h->hidden_base = (bar0 & 0xFF000000u) + hidden_ofs;
 	h->hidden_ready = true;
-	it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-	return 0;
+
+restore_e1:
+	/* Return P2SB to the exact visibility state observed on entry. */
+	if (e1_changed) {
+		if (pci_bus_write_config_byte(bus, pch_f1, 0xE1, e1)) {
+			h->hidden_base = 0;
+			h->hidden_ready = false;
+			return -EIO;
+		}
+		usleep_range(1000, 2000);
+	}
+	return ret;
+
+fallback:
+	/* Z390 firmware uses a fixed sideband aperture when BAR0 is unavailable. */
+	if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
+		h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
+		h->hidden_ready = true;
+		return 0;
+	}
+	return -ENODEV;
 }
 
 /* ----- Intel BIOS Data/Feature mask helpers ----- */
@@ -1613,6 +1801,7 @@ static int _save_regs(struct it87_h2ram_handle *h)
 		if (ret)
 			return ret;
 	} else if (v == IT87_H2_VENDOR_INTEL) {
+		/* Snapshot the public bridge decode registers before taking ownership. */
 		ret = pci_reg_read(h->bridge, 0xD8, &h->ord8);
 		if (ret)
 			return ret;
@@ -1621,6 +1810,7 @@ static int _save_regs(struct it87_h2ram_handle *h)
 			return ret;
 
 		if (h->hidden_ready && h->hidden_base) {
+			/* Snapshot the matching PCR copies for rollback and module unload. */
 			hb = ioremap(h->hidden_base, 0x200);
 			if (!hb)
 				return -ENOMEM;
@@ -1732,6 +1922,7 @@ rollback:
 static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
 	void __iomem *hb;
+	u32 verify;
 	int ret;
 
 	if (!h || !h->bridge)
@@ -1742,7 +1933,10 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (h->current_base == h->base[idx])
 		return 0; /* already active */
 
-	/* Hidden-window mirror first if available */
+	/*
+	 * Program the private DMI PCR copies first.  Until these mirrors agree,
+	 * writes to the public bridge registers may not affect forwarded cycles.
+	 */
 	if (h->hidden_ready) {
 		hb = ioremap(h->hidden_base, 0x200);
 		if (!hb)
@@ -1750,12 +1944,17 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 
 		writel(h->r98[idx], hb + 0x40);
 		writel(h->rd8[idx], hb + 0x44);
-		/* Flush posted writes before programming the PCI mirror. */
-		(void)readl(hb + 0x44);
+		/* Read back both dwords, also flushing any posted MMIO writes. */
+		if (readl(hb + 0x40) != h->r98[idx] ||
+		    readl(hb + 0x44) != h->rd8[idx]) {
+			iounmap(hb);
+			ret = -EIO;
+			goto rollback;
+		}
 		iounmap(hb);
 	}
 
-	/* Then program PCI config */
+	/* Publish the same decode values through the visible ISA bridge. */
 	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
 	if (ret)
 		goto rollback;
@@ -1763,11 +1962,23 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
 	if (ret)
 		goto rollback;
+	/* Confirm both public registers accepted the requested decode state. */
+	ret = pci_reg_read(h->bridge, 0xD8, &verify);
+	if (ret || verify != h->rd8[idx]) {
+		ret = ret ? ret : -EIO;
+		goto rollback;
+	}
+	ret = pci_reg_read(h->bridge, 0x98, &verify);
+	if (ret || verify != h->r98[idx]) {
+		ret = ret ? ret : -EIO;
+		goto rollback;
+	}
 
 	h->current_base = h->base[idx];
 	return 0;
 
 rollback:
+	/* Any partial update is unsafe, so restore all saved public and PCR state. */
 	_restore_regs(h);
 	return ret;
 }
@@ -1812,16 +2023,14 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 			h->is_amd   = (h->bridge->vendor == IT87_H2_VENDOR_AMD);
 			h->is_intel = (h->bridge->vendor == IT87_H2_VENDOR_INTEL);
 
-			/* For Intel, run the new detection scheme to set kind and, if
-	     * applicable (Skylake/Z390), compute and cache the hidden base
-	     * using it87_intel_init_hidden().
-	     */
+			/* Locate the matching DMI PCR mirror before saving bridge state. */
 			if (h->is_intel) {
 				int hret = it87_intel_init_hidden(h);
 				if (hret < 0) {
-					/* Ensure a clean generic state on failure */
-					h->hidden_ready = false;
-					h->hidden_base = 0;
+					pci_disable_device(h->bridge);
+					pci_dev_put(h->bridge);
+					h->bridge = NULL;
+					return hret;
 				}
 			}
 
@@ -1844,17 +2053,16 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 {
 	u32 base32;
+	u16 mask;
 
 	if (!h || !h->bridge)return -ENODEV;
 	if (idx<0 || idx>1)return -EINVAL;
 	if (mmio_base==0)return -EINVAL;
 	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
 
+	/* The bridge window is encoded at 64 KiB granularity. */
 	base32 = (u32)mmio_base;
 	base32 &= ~0xFFFFu;                        /* 64KiB align down */
-
-	h->base[idx]  = base32;
-	h->have[idx]  = true;
 
 	/* If bridge is amd calculate the register values for the bridge window of idx */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
@@ -1869,11 +2077,27 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 		}
 	/* If bridge is intel calculate the register values for the bridge window of idx */
 	} else if (h->bridge->vendor == IT87_H2_VENDOR_INTEL) {
-			u16 mask = _intel_bios_mask_for_data_space(base32);
-			if (!mask) mask = _intel_bios_mask_for_feat_space(base32);
-			h->r98[idx] = ((base32 >> 16) << 16) | 1u;   /* Generic Memory Range */
-			h->rd8[idx] = h->ord8 & ~(u32)mask;        /* active-low: clear mask bits */
-		}
+		/*
+		 * The primary 2E/2F controller always uses decode bit 0.  The
+		 * secondary 4E/4F controller selects an active-low BIOS-range bit
+		 * from its physical address.
+		 */
+		mask = idx == 0 ? BIT(0) :
+			_intel_bios_mask_for_data_space(base32);
+		if (!mask && idx == 1)
+			mask = _intel_bios_mask_for_feat_space(base32);
+		if (!mask)
+			return -EINVAL;
+		/* Bit 0 enables the generic memory range; clearing D8 routes it. */
+		h->r98[idx] = base32 | 1u;
+		h->rd8[idx] = h->ord8 & ~(u32)mask;
+	} else {
+		return -ENODEV;
+	}
+
+	/* Commit the slot only after every vendor-specific value is valid. */
+	h->base[idx] = base32;
+	h->have[idx] = true;
 
 	return 0;
 }
@@ -3105,19 +3329,22 @@ static void it87_restore_firmware_state(void *arg)
 	struct it87_data *data = arg;
 	int err;
 
-	if (!data->pwm_override_mask)
-		return;
-
-	err = it87_lock(data);
-	if (err) {
-		pr_warn("unable to restore firmware fan state during teardown: %d\n",
-			err);
-		return;
+	if (data->pwm_override_mask) {
+		err = it87_lock(data);
+		if (err) {
+			pr_warn("unable to restore firmware fan state during teardown: %d\n",
+				err);
+		} else {
+			it87_restore_overrides_to_firmware(data, true);
+			data->suspend_defaults_restored = false;
+			it87_unlock(data);
+		}
 	}
 
-	it87_restore_overrides_to_firmware(data, true);
-	data->suspend_defaults_restored = false;
-	it87_unlock(data);
+	err = it87_restore_gigabyte_noise_input(data);
+	if (err)
+		pr_warn("unable to restore Gigabyte noise input routing during teardown: %d\n",
+			err);
 }
 
 static struct it87_data *it87_update_device(struct device *dev)
@@ -4774,6 +5001,100 @@ static void gigabyte_ids_exit(void)
 	gigabyte_lid_valid = false;
 	gigabyte_dmi_valid = false;
 }
+
+struct it87_noise_point {
+	u16 mv;
+	u8 db;
+};
+
+/*
+ * Common Gigabyte noise calibration used by all actively supported AMD and
+ * Intel SIVs. The vendor utility performs nearest-neighbor lookup rather
+ * than interpolation.
+ */
+static const struct it87_noise_point it87_gigabyte_noise_curve[] = {
+	{  240, 30 }, {  270, 33 }, {  320, 40 }, {  340, 44 },
+	{  360, 47 }, {  380, 50 }, {  400, 53 }, {  430, 56 },
+	{  460, 60 }, {  500, 62 }, {  540, 65 }, {  580, 68 },
+	{  620, 70 }, {  670, 71 }, {  730, 72 }, {  790, 73 },
+	{  860, 74 }, {  940, 75 }, { 1040, 76 }, { 1140, 77 },
+	{ 1230, 78 }, { 1280, 79 }, { 1330, 80 }, { 1380, 81 },
+	{ 1430, 82 }, { 1490, 83 }, { 1540, 84 }, { 1600, 85 },
+	{ 1620, 86 }, { 1650, 87 }, { 1680, 88 }, { 1710, 89 },
+	{ 1730, 90 },
+};
+
+static int it87_gigabyte_noise_from_raw(u8 raw)
+{
+	int mv = raw * IT87_GIGABYTE_NOISE_ADC_MV;
+	int best = 0;
+	int best_delta;
+	int delta;
+	int i;
+
+	if (mv <= IT87_GIGABYTE_NOISE_CUTOFF_MV)
+		return 0;
+
+	best_delta = mv > it87_gigabyte_noise_curve[0].mv ?
+		     mv - it87_gigabyte_noise_curve[0].mv :
+		     it87_gigabyte_noise_curve[0].mv - mv;
+
+	for (i = 1; i < ARRAY_SIZE(it87_gigabyte_noise_curve); i++) {
+		delta = mv > it87_gigabyte_noise_curve[i].mv ?
+			mv - it87_gigabyte_noise_curve[i].mv :
+			it87_gigabyte_noise_curve[i].mv - mv;
+		if (delta < best_delta) {
+			best = i;
+			best_delta = delta;
+		}
+	}
+
+	return it87_gigabyte_noise_curve[best].db;
+}
+
+static ssize_t noise1_input_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct it87_data *data = dev_get_drvdata(dev);
+	int raw;
+	int err;
+
+	if (!data->has_noise)
+		return -ENODEV;
+
+	err = it87_lock(data);
+	if (err)
+		return err;
+
+	raw = data->read(data, IT87_REG_VIN[IT87_GIGABYTE_NOISE_VIN]);
+	it87_unlock(data);
+
+	/* Vendor behavior: an individual failed read becomes 0 V -> 0 dB. */
+	if (raw < 0)
+		raw = 0;
+
+	return sprintf(buf, "%d\n",
+		       it87_gigabyte_noise_from_raw((u8)raw));
+}
+
+static ssize_t noise1_label_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Noise Level\n");
+}
+
+static DEVICE_ATTR_RO(noise1_input);
+static DEVICE_ATTR_RO(noise1_label);
+
+static struct attribute *it87_attributes_noise[] = {
+	&dev_attr_noise1_input.attr,
+	&dev_attr_noise1_label.attr,
+	NULL
+};
+
+static const struct attribute_group it87_group_noise = {
+	.attrs = it87_attributes_noise,
+};
 
 static umode_t it87_in_is_visible(struct kobject *kobj,
 				  struct attribute *attr, int index)
@@ -6483,6 +6804,8 @@ static int it87_probe(struct platform_device *pdev)
 	struct resource       *res_ecio;
 	struct device         *dev       = &pdev->dev;
 	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
+	struct gbw_siv_info    siv_info;
+	const char             *hwmon_name;
 	int                    enable_pwm_interface;
 	struct device         *hwmon_dev;
 	int                    err;
@@ -6490,6 +6813,14 @@ static int it87_probe(struct platform_device *pdev)
 	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+	hwmon_name = it87_devices[sio_data->type].name;
+	if (!gbw_read_siv_info(&siv_info)) {
+		hwmon_name = devm_kasprintf(dev, GFP_KERNEL, "%s_%08x",
+					   hwmon_name, siv_info.siv);
+		if (!hwmon_name)
+			return -ENOMEM;
+	}
 
 	/*
      * Resource layout from it87_device_add():
@@ -6589,6 +6920,8 @@ static int it87_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	data->has_noise = it87_gigabyte_noise_supported(data);
+
 	it87_detect_h2ram_smartfan(dev, data);
 
 	enable_pwm_interface = it87_check_pwm(dev);
@@ -6625,6 +6958,8 @@ static int it87_probe(struct platform_device *pdev)
 	data->in_internal      = sio_data->internal;
 	data->need_in7_reroute = sio_data->need_in7_reroute;
 	data->has_in           = 0x3ff & ~sio_data->skip_in;
+	if (data->has_noise)
+		data->has_in &= ~BIT(IT87_GIGABYTE_NOISE_VIN);
 
 	if (has_four_temp(data))
 	{
@@ -6679,6 +7014,9 @@ static int it87_probe(struct platform_device *pdev)
 	data->groups[2] = &it87_group_temp;
 	data->groups[3] = &it87_group_fan;
 
+	if (data->has_noise)
+		data->groups[4] = &it87_group_noise;
+
 	if (enable_pwm_interface)
 	{
 		data->has_pwm = BIT(ARRAY_SIZE(IT87_REG_PWM)) - 1;
@@ -6689,11 +7027,23 @@ static int it87_probe(struct platform_device *pdev)
 			data->has_pwm |= (BIT(data->it57xx_fans) - 1)
 					 << IT87_H2RAM_BASE_FANS;
 
-		data->groups[4] = &it87_group_pwm;
+		data->groups[data->has_noise ? 5 : 4] = &it87_group_pwm;
 		/* H2RAM vectors are BIOS-owned in this barebones implementation. */
 		if ((has_old_autopwm(data) || has_newer_autopwm(data)) &&
 		    data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
-			data->groups[5] = &it87_group_auto_pwm;
+			data->groups[data->has_noise ? 6 : 5] =
+				&it87_group_auto_pwm;
+	}
+
+	/*
+	 * Match the vendor utility's quirk: VIN3 mux setup is best-effort and
+	 * does not revoke support when configuration mode cannot be entered.
+	 */
+	if (data->has_noise) {
+		err = it87_configure_gigabyte_noise_input(data);
+		if (err)
+			dev_warn(dev, "Unable to configure Gigabyte noise input (%d)\n",
+				 err);
 	}
 
 	/*
@@ -6705,7 +7055,7 @@ static int it87_probe(struct platform_device *pdev)
 		return err;
 
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
-			     it87_devices[sio_data->type].name,
+			     hwmon_name,
 			     data, data->groups);
 	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
@@ -6715,6 +7065,14 @@ static void it87_resume_sio(struct platform_device *pdev)
 	struct it87_data *data = dev_get_drvdata(&pdev->dev);
 	int err;
 	int reg2c;
+
+	if (data->has_noise) {
+		err = it87_configure_gigabyte_noise_input(data);
+		if (err)
+			dev_warn(&pdev->dev,
+				 "Unable to reconfigure Gigabyte noise input (%d)\n",
+				 err);
+	}
 
 	if (!data->need_in7_reroute)
 		return;
@@ -7148,22 +7506,27 @@ static int __init sm_it87_init(void)
 			int         slot;
 			int         ret;
 
+			/* Acquire the ISA bridge and snapshot its decode state once. */
 			if (!it87_h2_global_inited) {
 				ret = it87_h2_global_init();
 				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
+					pr_err("H2RAM global bridge init failed: %d\n",
+					       ret);
+					err = ret;
+					goto exit_unregister;
 				} else {
 					it87_h2_global_inited = true;
 				}
 			}
 			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
+				/* Register the controller's address as slot 0=2E or slot 1=4E. */
 				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
 				ret = it87_h2_global_set_slot(slot, base);
 				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
+					pr_err("H2RAM set_slot(%d,%pa) failed: %d\n",
+					       slot, &base, ret);
+					err = ret;
+					goto exit_unregister;
 				}
 			}
 		}

@@ -20,6 +20,21 @@ Note that when upgrading make sure to run sudo ./dkms-remove.sh
 before updating local git repo. Otherwise old module may not be removed.
 If this is the case, remove module manually using dkms commands.
 
+Secondary Installation of Optional Labels for Gigabyte Boards
+-------------------------------------------------------------
+
+To install:
+
+* cd "Sensors configs/Gigabyte"
+* sudo ./install-sensorsd.sh
+
+Note that these labels are entirely optional.
+They're designed to give you appropriate sensor mappings and properly scaled voltage readouts.
+Also note that programs like Coolercontrol won't pick up these names.
+They're only read by applications aware of sensors.d configuration files.
+Finally, the old configs have been moved to "Sensors configs/old configs"
+for the older sensors.d maps of certain Gigabyte Motherboards.
+
 Manual Installation (without DKMS)
 ----------------------------------
 
@@ -138,11 +153,23 @@ Add OLED status monitoring and setting (for certain boards with this feature).
 
 Add USB2DACUP voltage setting and monitoring (for certain boards with this feature).
 
-Add Noise Monitoring Support (For certain boards with this feature).
-
 
 CHANGELOG:
 =========
+
+SUPPORT NOTE - Sep 2026
+============
+
+Adds full support for the noise sensor present on many high end Gigabyte motherboards.
+These sensors are exposed as noiseX_input and the label is noiseX_label.
+Note that these sensors aren't properly supported normally via the "sensors" command,
+nor are the available through libsensors. This is down to them using decibels for their units.
+You can still query them directly and use the values as you see fit.
+
+Adds full labels for all modern Gigabyte motherboards starting with the intel 200 series and AMD 300 series boards.
+You can find the installer in "Sensors configs/configs/Gigabyte". You can also manually copy over the configs if you desire.
+Note that for SkylakeX and KabylakeX you need to tell the installer which one is in your board, as the voltage mappings vary
+based on the processor architecture. See the installer README for details.
 
 SUPPORT NOTE - Aug 2026
 ============
