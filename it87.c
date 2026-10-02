@@ -5009,7 +5009,7 @@ static int __init gigabyte_ids_init(void)
 	else
 		pr_warn("Failed to read Gigabyte LID ID\n");
 
-	gigabyte_class = class_create("gigabyte");
+	gigabyte_class = class_create(THIS_MODULE, "gigabyte");
 	if (IS_ERR(gigabyte_class)) {
 		ret = PTR_ERR(gigabyte_class);
 		gigabyte_class = NULL;
