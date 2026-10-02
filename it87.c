@@ -7433,6 +7433,9 @@ static const struct dmi_system_id it87_dmi_table[] __initconst = {
 	IT87_DMI_MATCH_GBT("X399 DESIGNARE EX-CF", it87_dmi_cb,
 			   &it87_acpi_ignore),
 		/* IT8686E + IT8792E/IT8795E */
+	IT87_DMI_MATCH_GBT("X399 AORUS PRO-CF", it87_dmi_cb,
+			   &it87_acpi_ignore),
+		/* IT8686E + IT8792E/IT8795E */
 	IT87_DMI_MATCH_GBT("B450 AORUS PRO-CF", it87_dmi_cb,
 			   &it87_acpi_ignore),
 		/* IT8686E + IT8792E/IT8795E */
