@@ -1086,6 +1086,7 @@ struct it87_data {
 	u8 it57xx_fans;
 	u8 h2ram_pwm_mode[IT87_H2RAM_MAX_FANS];
 	bool h2ram_vector_saved[IT87_H2RAM_MAX_FANS];
+	u8 h2ram_g2_stop_saved[IT87_H2RAM_MAX_FANS][2];
 	/* start temp, full temp, start PWM, slope LSB, slope MSB */
 	u8 h2ram_primary_saved[IT87_H2RAM_MAX_FANS][5];
 	u8 h2ram_extra_start_saved[IT87_H2RAM_MAX_FANS]
@@ -2119,11 +2120,43 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 	return 0;
 }
 
+/* Firmware may restore the bridge routing without notifying the driver. */
+static bool _intel_slot_intact(struct it87_h2ram_handle *h, int idx)
+{
+	void __iomem *hb;
+	u32 d8, r98;
+	bool intact;
+
+	if (pci_reg_read(h->bridge, 0xD8, &d8) ||
+	    pci_reg_read(h->bridge, 0x98, &r98))
+		return false;
+	if (d8 != h->rd8[idx] || r98 != h->r98[idx])
+		return false;
+
+	if (!h->hidden_ready)
+		return true;
+
+	hb = ioremap(h->hidden_base, 0x200);
+	if (!hb)
+		return false;
+
+	intact = readl(hb + 0x40) == h->r98[idx] &&
+		 readl(hb + 0x44) == h->rd8[idx];
+	iounmap(hb);
+
+	return intact;
+}
+
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 {
 	if (!h || !h->bridge)return -ENODEV;
 	if (idx<0 || idx>1)return -EINVAL;
 	if (!h->have[idx])return -ENOENT;
+
+	if (h->bridge->vendor == IT87_H2_VENDOR_INTEL &&
+	    h->current_base == h->base[idx] &&
+	    !_intel_slot_intact(h, idx))
+		h->current_base = 0;
 
 	/* Program window on demand for all vendors */
 	if (h->current_base != h->base[idx]) {
@@ -3092,6 +3125,11 @@ static void it87_h2ram_save_vector(struct it87_data *data, int nr)
 
 	base = it87_h2ram_vector_base(data, nr);
 
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
+		data->h2ram_g2_stop_saved[nr][0] = data->read(data, base);
+		data->h2ram_g2_stop_saved[nr][1] = data->read(data, base + 1);
+	}
+
 	data->h2ram_primary_saved[nr][0] = data->read(data, base + 2);
 	data->h2ram_primary_saved[nr][1] = data->read(data, base + 3);
 	data->h2ram_primary_saved[nr][2] = data->read(data, base + 4);
@@ -3131,6 +3169,9 @@ static void it87_h2ram_set_manual(struct it87_data *data, int nr, u8 pwm)
 		data->write(data, base + 3, 0x7f); /* full-speed temp */
 		data->write(data, base + 4, pwm);  /* direct duty */
 		data->write(data, base + 5, 0x00); /* primary slope */
+		/* The firmware's fan-stop thresholds otherwise override this vector. */
+		data->write(data, base, 0x00);
+		data->write(data, base + 1, 0x00);
 	} else {
 		/* G3 explicitly disables an extra vector when Start Temp == 0x64. */
 		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
@@ -3172,6 +3213,10 @@ static void it87_h2ram_restore_vector(struct it87_data *data, int nr,
 	data->write(data, base + 4, data->h2ram_primary_saved[nr][2]);
 	data->write(data, base + 3, data->h2ram_primary_saved[nr][1]);
 	data->write(data, base + 2, data->h2ram_primary_saved[nr][0]);
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
+		data->write(data, base + 1, data->h2ram_g2_stop_saved[nr][1]);
+		data->write(data, base, data->h2ram_g2_stop_saved[nr][0]);
+	}
 
 	if (release)
 		data->h2ram_vector_saved[nr] = false;
