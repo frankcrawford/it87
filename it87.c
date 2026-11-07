@@ -7424,6 +7424,9 @@ static const struct dmi_system_id it87_dmi_table[] __initconst = {
 		/* IT8688E */
 	IT87_DMI_MATCH_GBT("Z97X-Gaming G1", it87_dmi_cb, NULL),
 		/* ? + IT8790E */
+	IT87_DMI_MATCH_GBT("TRX40 DESIGNARE", it87_dmi_cb,
+			  &it87_acpi_ignore),
+		/* IT8688E + IT8792E/IT8795E */
 	IT87_DMI_MATCH_GBT("TRX40 AORUS XTREME", it87_dmi_cb,
 			   &it87_acpi_ignore),
 		/* IT8688E + IT8792E/IT8795E */
