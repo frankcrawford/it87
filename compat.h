@@ -88,4 +88,11 @@ static int __maybe_unused it87_resume(struct device *dev);
 #define pm_sleep_ptr(_ptr)	_ptr
 #endif
 
+/*
+ *  Fix change in API since 6.4.0 - reference PR #142
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define class_create(name) class_create(THIS_MODULE, name)
+#endif
+
 #endif /* COMPAT_H */
