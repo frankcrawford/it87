@@ -1,0 +1,24 @@
+name: DKMS CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt install -y linux-headers-$(uname -r) dkms
+
+    - name: Clean
+      run: make clean
+
+    - name: Build
+      run: sudo make dkms
+
+    - name: Clean-up
+      run: sudo make dkms_clean
