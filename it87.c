@@ -232,13 +232,13 @@ static inline void superio_exit(int ioreg, bool noexit)
 /* PCI Read Routine */
 static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
 {
-	return pci_read_config_dword(d, off, v);
+	return pcibios_err_to_errno(pci_read_config_dword(d, off, v));
 }
 
 /* PCI Write Routine */
 static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 {
-	return pci_write_config_dword(d, off, v);
+	return pcibios_err_to_errno(pci_write_config_dword(d, off, v));
 }
 
 /* Logical device 4 registers */
@@ -1574,6 +1574,7 @@ struct it87_h2ram_handle
 	u32 hidden_orig_0x40; 	/* Original mirror 98 at hidden_base+0x40 */
 	bool saved;				/* original PCI bridge registers are valid */
 	bool hidden_saved;		/* original Intel hidden mirror is valid */
+	bool hidden_fallback;
 
 	/* Per-slot requested windows (idx 0=2E, 1=4E), 64KiB aligned */
 	u32 base[2];
@@ -1585,11 +1586,13 @@ struct it87_h2ram_handle
 	u32 rd8[2];
 	u32 r98[2];
 	bool have[2];
+	bool switch_mmio[2];
 
 	u32 hidden_base;   		/* hidden base address for z390/skylake bridges */
 	bool hidden_ready;       /* hidden window ready/available */
-	/* AMD/Intel: track currently programmed base to minimize churn */
-	u32 current_base;
+	/* 0: no active slot; 1: 2E; 2: 4E */
+	u8 current_slot;
+	u8 suspended_slots;
 };
 
 /* Global MMIO bridge state tracking */
@@ -1640,9 +1643,10 @@ static bool cpu_is_skl_kbl_cfl_family(void)
 }
 
 /* Detect platform and compute/capture hidden base and
- * originals, unlocking E1=0x10 as needed. Caches kind, base, and originals
- * into 'h'. For generic Intel (no hidden window), marks hidden_ready=false. */
-static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
+ * originals, unlocking E1=0x10 as needed. Caches kind and base into
+ * 'h'. PCR discovery is optional unless the selected bridge requires it. */
+static int it87_intel_init_hidden(struct it87_h2ram_handle *h,
+				  bool switch_mmio)
 {
 	struct pci_bus *bus;
 	unsigned int pch_f1 = PCI_DEVFN(0x1f, 1);
@@ -1658,25 +1662,27 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		return -EINVAL;
 
 	h->hidden_ready = false;
+	h->hidden_base = 0;
+	h->hidden_fallback = false;
 
-	/*
-	 * Select the PCR port ID used by this PCH generation.  Platform IDs
-	 * 4 and 6 use the newer DMI port; earlier client generations use the
-	 * Skylake-family DMI port.  Other Intel bridges need no PCR mirror.
-	 */
+	/* Switched MMIO uses the P2SB DMI PCR port.  The legacy
+	 * shared-memory path uses the platform-selected PCR port. */
 	siv_ret = gbw_siv_platform_id(&platform);
-	if (siv_ret == 0 && (platform == 4 || platform == 6)) {
+	if (siv_ret == 0 && (platform == 4 || platform == 6))
 		h->intel_isabridge_type = IT87_ISA_INTEL_Z390;
-		hidden_ofs = IT87_HIDDEN_OFS_Z390;
-	} else if (cpu_is_skl_kbl_cfl_family()) {
+	else if (cpu_is_skl_kbl_cfl_family())
 		h->intel_isabridge_type = IT87_ISA_INTEL_SKYLAKE;
-		hidden_ofs = IT87_HIDDEN_OFS_SKYLAKE;
-	} else {
+	else
 		h->intel_isabridge_type = IT87_ISA_INTEL_GENERIC;
-		h->hidden_base = 0;
-		h->hidden_ready = false;
+
+	if (switch_mmio)
+		hidden_ofs = IT87_HIDDEN_OFS_SKYLAKE;
+	else if (h->intel_isabridge_type == IT87_ISA_INTEL_Z390)
+		hidden_ofs = IT87_HIDDEN_OFS_Z390;
+	else if (h->intel_isabridge_type == IT87_ISA_INTEL_SKYLAKE)
+		hidden_ofs = IT87_HIDDEN_OFS_SKYLAKE;
+	else
 		return 0;
-	}
 
 	/*
 	 * Address P2SB through the root bus config-space operations.  P2SB is
@@ -1687,15 +1693,21 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 	if (!bus)
 		goto fallback;
 
+	/* Prevent PCI enumeration while P2SB is temporarily visible. */
+	pci_lock_rescan_remove();
 	/* Save the function-hide control so visibility can be restored exactly. */
 	ret = pci_bus_read_config_byte(bus, pch_f1, 0xE1, &e1);
-	if (ret)
+	if (ret) {
+		pci_unlock_rescan_remove();
 		goto fallback;
+	}
 	if (e1 != 0x10) {
 		/* Clear the hide state while retaining the required control bits. */
 		ret = pci_bus_write_config_byte(bus, pch_f1, 0xE1, 0x10);
-		if (ret)
+		if (ret) {
+			pci_unlock_rescan_remove();
 			return -EIO;
+		}
 		usleep_range(1000, 2000);
 		e1_changed = true;
 	}
@@ -1707,12 +1719,38 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		goto restore_e1;
 	}
 	if (!bar0 || bar0 == 0xFFFFFFFFu) {
-		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
+		if (h->intel_isabridge_type == IT87_ISA_INTEL_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
+			h->hidden_fallback = true;
 			goto restore_e1;
 		}
-		ret = -ENODEV;
+		ret = switch_mmio &&
+		      h->intel_isabridge_type == IT87_ISA_INTEL_GENERIC ?
+		      0 : -ENODEV;
+		goto restore_e1;
+	}
+	if (bar0 & PCI_BASE_ADDRESS_SPACE_IO) {
+		ret = -EINVAL;
+		goto restore_e1;
+	}
+	if ((bar0 & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
+	    PCI_BASE_ADDRESS_MEM_TYPE_64) {
+		u32 bar1;
+
+		ret = pci_bus_read_config_dword(bus, pch_f1,
+						PCI_BASE_ADDRESS_1, &bar1);
+		if (ret) {
+			ret = -EIO;
+			goto restore_e1;
+		}
+		if (bar1) {
+			ret = -ERANGE;
+			goto restore_e1;
+		}
+	} else if ((bar0 & PCI_BASE_ADDRESS_MEM_TYPE_MASK) !=
+		   PCI_BASE_ADDRESS_MEM_TYPE_32) {
+		ret = -EINVAL;
 		goto restore_e1;
 	}
 	/* Add the generation-specific DMI PCR port and register-block offset. */
@@ -1725,20 +1763,25 @@ restore_e1:
 		if (pci_bus_write_config_byte(bus, pch_f1, 0xE1, e1)) {
 			h->hidden_base = 0;
 			h->hidden_ready = false;
-			return -EIO;
+			ret = -EIO;
+		} else {
+			usleep_range(1000, 2000);
 		}
-		usleep_range(1000, 2000);
 	}
+	pci_unlock_rescan_remove();
 	return ret;
 
 fallback:
-	/* Z390 firmware uses a fixed sideband aperture when BAR0 is unavailable. */
-	if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
+	/* Only use the fixed fallback where the platform identifies that port. */
+	if (h->intel_isabridge_type == IT87_ISA_INTEL_Z390) {
 		h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 		h->hidden_ready = true;
+		h->hidden_fallback = true;
 		return 0;
 	}
-	return -ENODEV;
+	return switch_mmio &&
+	       h->intel_isabridge_type == IT87_ISA_INTEL_GENERIC ?
+	       0 : -ENODEV;
 }
 
 /* ----- Intel BIOS Data/Feature mask helpers ----- */
@@ -1779,11 +1822,49 @@ static u16 _intel_bios_mask_for_feat_space(u32 base)
 	return 0;
 }
 
+static u16 it87_intel_slot_mask(int idx, u32 base)
+{
+	u16 mask;
+
+	if (!idx)
+		return BIT(0);
+	mask = _intel_bios_mask_for_data_space(base);
+	if (!mask)
+		mask = _intel_bios_mask_for_feat_space(base);
+	return mask;
+}
+
+/* The generic memory window uses D8 bit 0 set.  BIOS decode windows
+ * use their selected active-low bit, including when addressed by 2E. */
+static bool it87_intel_primary_generic(u32 base)
+{
+	return !_intel_bios_mask_for_data_space(base) &&
+	       !_intel_bios_mask_for_feat_space(base);
+}
+
+static u32 it87_intel_active_mask(const struct it87_h2ram_handle *h,
+				  int idx)
+{
+	if (!h->switch_mmio[idx])
+		return BIT(0);
+	return it87_intel_slot_mask(idx, h->base[idx]);
+}
+
+static u32 it87_intel_owned_decode_mask(const struct it87_h2ram_handle *h)
+{
+	u32 mask = 0;
+
+	if (h->have[0])
+		mask |= it87_intel_active_mask(h, 0);
+	if (h->have[1])
+		mask |= it87_intel_active_mask(h, 1);
+	return mask;
+}
+
 /* ----- internal save/restore of original bridge state ----- */
 
 static int _save_regs(struct it87_h2ram_handle *h)
 {
-	void __iomem *hb;
 	int ret;
 	u16 v;
 
@@ -1804,25 +1885,12 @@ static int _save_regs(struct it87_h2ram_handle *h)
 		if (ret)
 			return ret;
 	} else if (v == IT87_H2_VENDOR_INTEL) {
-		/* Snapshot the public bridge decode registers before taking ownership. */
 		ret = pci_reg_read(h->bridge, 0xD8, &h->ord8);
 		if (ret)
 			return ret;
 		ret = pci_reg_read(h->bridge, 0x98, &h->or98);
 		if (ret)
 			return ret;
-
-		if (h->hidden_ready && h->hidden_base) {
-			/* Snapshot the matching PCR copies for rollback and module unload. */
-			hb = ioremap(h->hidden_base, 0x200);
-			if (!hb)
-				return -ENOMEM;
-
-			h->hidden_orig_0x40 = readl(hb + 0x40);
-			h->hidden_orig_0x44 = readl(hb + 0x44);
-			h->hidden_saved = true;
-			iounmap(hb);
-		}
 	} else {
 		return -ENODEV;
 	}
@@ -1831,51 +1899,159 @@ static int _save_regs(struct it87_h2ram_handle *h)
 	return 0;
 }
 
-static void _restore_regs(struct it87_h2ram_handle *h)
+
+/* A single PCR snapshot follows the currently selected bridge window. */
+static int it87_intel_restore_hidden(struct it87_h2ram_handle *h)
 {
 	void __iomem *hb;
+	u32 current40, current44, value40, value44, changed, mask;
+	int ret = 0;
+
+	if (!h->hidden_saved)
+		return 0;
+
+	hb = ioremap(h->hidden_base, 0x200);
+	if (!hb)
+		return -ENOMEM;
+
+	current40 = readl(hb + 0x40);
+	current44 = readl(hb + 0x44);
+	if (current40 == U32_MAX && current44 == U32_MAX) {
+		iounmap(hb);
+		return -EIO;
+	}
+
+	mask = it87_intel_owned_decode_mask(h);
+	value40 = h->hidden_orig_0x40;
+	value44 = h->hidden_orig_0x44;
+	if (h->current_slot) {
+		int idx = h->current_slot - 1;
+
+		changed = (current40 ^ h->r98[idx]) & ~0xffff0001u;
+		value40 = (value40 & ~changed) | (current40 & changed);
+		changed = (current44 ^ h->rd8[idx]) & ~mask;
+		value44 = (value44 & ~changed) | (current44 & changed);
+	}
+	/* Both APIs own only their selected decode mask. */
+	value44 = (current44 & ~mask) | (value44 & mask);
+
+	writel(value40, hb + 0x40);
+	writel(value44, hb + 0x44);
+	if (readl(hb + 0x40) != value40 ||
+	    readl(hb + 0x44) != value44)
+		ret = -EIO;
+	iounmap(hb);
+	if (!ret)
+		h->hidden_saved = false;
+	return ret;
+}
+
+static int _restore_regs(struct it87_h2ram_handle *h);
+
+static int it87_intel_select_hidden(struct it87_h2ram_handle *h, int idx)
+{
+	u32 offset, base;
 	int ret;
+
+	if (!h->hidden_ready || h->hidden_fallback)
+		return 0;
+
+	offset = h->switch_mmio[idx] ||
+		 h->intel_isabridge_type == IT87_ISA_INTEL_SKYLAKE ?
+		 IT87_HIDDEN_OFS_SKYLAKE : IT87_HIDDEN_OFS_Z390;
+	base = (h->hidden_base & 0xFF000000u) + offset;
+	if (base == h->hidden_base)
+		return 0;
+
+	if (h->hidden_saved && h->current_slot &&
+	    h->switch_mmio[h->current_slot - 1])
+		ret = _restore_regs(h);
+	else
+		ret = it87_intel_restore_hidden(h);
+	if (ret)
+		return ret;
+	h->hidden_base = base;
+	h->current_slot = 0;
+	return 0;
+}
+
+static int _restore_regs(struct it87_h2ram_handle *h)
+{
+	int ret, err = 0;
+	u32 value, target, verify, mask;
 	u16 v;
 
 	if (!h || !h->bridge || !h->saved)
-		return;
+		return 0;
 
 	v = h->bridge->vendor;
 	if (v == IT87_H2_VENDOR_AMD) {
-		ret = pci_reg_write(h->bridge, 0x48, h->or48);
-		if (ret)
+		ret = pci_reg_read(h->bridge, 0x48, &value);
+		if (!ret)
+			ret = pci_reg_write(h->bridge, 0x48,
+				(value & ~BIT(5)) | (h->or48 & BIT(5)));
+		if (ret) {
 			pr_warn("failed to restore AMD bridge register 0x48: %d\n", ret);
+			err = ret;
+		}
 		ret = pci_reg_write(h->bridge, 0x60, h->or60);
-		if (ret)
+		if (ret) {
 			pr_warn("failed to restore AMD bridge register 0x60: %d\n", ret);
+			if (!err)
+				err = ret;
+		}
 		ret = pci_reg_write(h->bridge, 0x6C, h->or6c);
-		if (ret)
+		if (ret) {
 			pr_warn("failed to restore AMD bridge register 0x6c: %d\n", ret);
+			if (!err)
+				err = ret;
+		}
 	} else if (v == IT87_H2_VENDOR_INTEL) {
-		/* Mirror hidden first, then PCI config */
-		if (h->hidden_saved && h->hidden_base) {
-			hb = ioremap(h->hidden_base, 0x200);
-			if (hb) {
-				writel(h->hidden_orig_0x40, hb + 0x40);
-				writel(h->hidden_orig_0x44, hb + 0x44);
-				/* Flush posted writes before the mapping is dropped. */
-				(void)readl(hb + 0x44);
-				iounmap(hb);
-			} else {
-				pr_warn("unable to map Intel hidden bridge window while restoring state\n");
+		mask = it87_intel_owned_decode_mask(h);
+		ret = it87_intel_restore_hidden(h);
+		if (ret) {
+			pr_warn("failed to restore Intel PCR: %d\n", ret);
+			err = ret;
+		}
+		ret = pci_reg_read(h->bridge, 0xD8, &value);
+		if (!ret) {
+			target = (value & ~mask) | (h->ord8 & mask);
+			ret = pci_reg_write(h->bridge, 0xD8, target);
+			if (!ret) {
+				ret = pci_reg_read(h->bridge, 0xD8, &verify);
+				if (!ret && ((verify ^ target) & mask))
+					ret = -EIO;
 			}
 		}
-		ret = pci_reg_write(h->bridge, 0xD8, h->ord8);
-		if (ret)
-			pr_warn("failed to restore Intel bridge register 0xd8: %d\n", ret);
-		ret = pci_reg_write(h->bridge, 0x98, h->or98);
-		if (ret)
-			pr_warn("failed to restore Intel bridge register 0x98: %d\n", ret);
+		if (ret) {
+			pr_warn("failed to restore/verify Intel PCI 0xd8: %d\n", ret);
+			if (!err)
+				err = ret;
+		}
+		ret = pci_reg_read(h->bridge, 0x98, &value);
+		if (!ret) {
+			target = (value & ~0xffff0001u) |
+				 (h->or98 & 0xffff0001u);
+			ret = pci_reg_write(h->bridge, 0x98, target);
+			if (!ret) {
+				ret = pci_reg_read(h->bridge, 0x98, &verify);
+				if (!ret && ((verify ^ target) & 0xffff0001u))
+					ret = -EIO;
+			}
+		}
+		if (ret) {
+			pr_warn("failed to restore/verify Intel PCI 0x98: %d\n", ret);
+			if (!err)
+				err = ret;
+		}
+
 	}
 
-	/* Never trust the cached slot after a restore or rollback. */
-	h->current_base = 0;
+	if (!err)
+		h->current_slot = 0;
+	return err > 0 ? -EIO : err;
 }
+
 
 /* ----- discrete per-slot programming ----- */
 
@@ -1898,6 +2074,10 @@ static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (idx < 0 || idx > 1 || !h->have[idx])
 		return -EINVAL;
 
+	ret = pci_reg_read(h->bridge, 0x48, &h->r48[idx]);
+	if (ret)
+		return ret;
+	h->r48[idx] |= BIT(5);
 	ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
 	if (ret)
 		goto rollback;
@@ -1908,7 +2088,7 @@ static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (ret)
 		goto rollback;
 
-	h->current_base = h->base[idx];
+	h->current_slot = idx + 1;
 	return 0;
 
 rollback:
@@ -1916,16 +2096,17 @@ rollback:
 	return ret;
 }
 
+
 /* Intel:
- *  0x98: (START<<16)|1 with START=(base>>16)
- *  0xD8: clear enable bit(s) (active-low):
- *        - slot0: clear bit0
- *        - slot1: clear one bit chosen from address tables
+ *  0x98: generic memory range (START<<16)|1
+ *  0xD8: generic range uses bit0 set; BIOS decode windows select their
+ *        address-derived active-low bit.  Legacy H2RAM preserves PCI 0x98.
  */
 static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-	void __iomem *hb;
-	u32 verify;
+	void __iomem *hb = NULL;
+	u32 verify, value40 = 0, value44 = 0, target44;
+	u32 mask = it87_intel_owned_decode_mask(h);
 	int ret;
 
 	if (!h || !h->bridge)
@@ -1933,58 +2114,74 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (idx < 0 || idx > 1 || !h->have[idx])
 		return -EINVAL;
 
-	if (h->current_base == h->base[idx])
-		return 0; /* already active */
-
-	/*
-	 * Program the private DMI PCR copies first.  Until these mirrors agree,
-	 * writes to the public bridge registers may not affect forwarded cycles.
-	 */
 	if (h->hidden_ready) {
 		hb = ioremap(h->hidden_base, 0x200);
 		if (!hb)
 			return -ENOMEM;
-
-		writel(h->r98[idx], hb + 0x40);
-		writel(h->rd8[idx], hb + 0x44);
-		/* Read back both dwords, also flushing any posted MMIO writes. */
-		if (readl(hb + 0x40) != h->r98[idx] ||
-		    readl(hb + 0x44) != h->rd8[idx]) {
-			iounmap(hb);
+		value40 = readl(hb + 0x40);
+		value44 = readl(hb + 0x44);
+		if (value40 == U32_MAX && value44 == U32_MAX) {
 			ret = -EIO;
-			goto rollback;
+			goto unmap;
 		}
-		iounmap(hb);
+		if (!h->hidden_saved) {
+			h->hidden_orig_0x40 = value40;
+			h->hidden_orig_0x44 = value44;
+			h->hidden_saved = true;
+		}
 	}
 
-	/* Publish the same decode values through the visible ISA bridge. */
+	/* This is the transport to use if an intervening write fails. */
+	h->current_slot = idx + 1;
+	if (h->hidden_ready) {
+		/* Retain the original bridge's PCR-first update order;
+		 * preserve all decode bits outside our selected masks. */
+		target44 = (value44 & ~mask) | (h->rd8[idx] & mask);
+		writel(h->r98[idx], hb + 0x40);
+		writel(target44, hb + 0x44);
+	}
+
 	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
 	if (ret)
 		goto rollback;
-
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
 	if (ret)
 		goto rollback;
-	/* Confirm both public registers accepted the requested decode state. */
+
+	if (h->hidden_ready) {
+		value40 = readl(hb + 0x40);
+		value44 = readl(hb + 0x44);
+		if (value40 != h->r98[idx] ||
+		    ((value44 ^ h->rd8[idx]) & mask)) {
+			ret = -EIO;
+			goto rollback;
+		}
+	}
 	ret = pci_reg_read(h->bridge, 0xD8, &verify);
-	if (ret || verify != h->rd8[idx]) {
+	if (ret || ((verify ^ h->rd8[idx]) & mask)) {
 		ret = ret ? ret : -EIO;
 		goto rollback;
 	}
 	ret = pci_reg_read(h->bridge, 0x98, &verify);
-	if (ret || verify != h->r98[idx]) {
+	if (ret || ((verify ^ h->r98[idx]) & 0xffff0001u)) {
 		ret = ret ? ret : -EIO;
 		goto rollback;
 	}
-
-	h->current_base = h->base[idx];
+	if (hb)
+		iounmap(hb);
 	return 0;
 
 rollback:
-	/* Any partial update is unsafe, so restore all saved public and PCR state. */
-	_restore_regs(h);
+	if (hb)
+		iounmap(hb);
+	if (_restore_regs(h))
+		pr_warn("Intel bridge rollback failed after activation error %d\n", ret);
+	return ret;
+unmap:
+	iounmap(hb);
 	return ret;
 }
+
 
 static int _enable_slot(struct it87_h2ram_handle *h, int idx)
 {
@@ -2047,9 +2244,6 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 		if (!pci_reg_read(h->bridge, 0xdc, &interface))
 			h->intel_espi = !!(interface & BIT(2));
 
-		ret = it87_intel_init_hidden(h);
-		if (ret < 0)
-			goto err_disable_bridge;
 	}
 
 	ret = _save_regs(h);
@@ -2067,15 +2261,31 @@ err_put_bridge:
 }
 
 /* Set up MMIO bridge register values */
-static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
+static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base,
+			    bool switch_mmio)
 {
 	u32 base32;
 	u16 mask;
+	int ret;
 
 	if (!h || !h->bridge)return -ENODEV;
 	if (idx<0 || idx>1)return -EINVAL;
 	if (mmio_base==0)return -EINVAL;
 	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
+
+	if (h->is_intel) {
+		/* One bridge API applies to a discovered controller configuration.
+		 * A mixed API would require independent PCR baselines; reject it
+		 * rather than using a snapshot from the wrong register block. */
+		if (h->have[idx ^ 1] &&
+		    h->switch_mmio[idx ^ 1] != switch_mmio)
+			return -EOPNOTSUPP;
+		if (!h->have[0] && !h->have[1] && !h->hidden_ready) {
+			ret = it87_intel_init_hidden(h, switch_mmio);
+			if (ret)
+				return ret;
+		}
+	}
 
 	/* The bridge window is encoded at 64 KiB granularity. */
 	base32 = (u32)mmio_base;
@@ -2084,11 +2294,9 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 	/* If bridge is amd calculate the register values for the bridge window of idx */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
 		if (idx == 1) {
-			h->r48[idx] = (h->or48 & ~BIT(5)) | BIT(5);
 			h->r60[idx] = ((((base32 >> 16) & 0xFFFFu) + 1u) << 16) | ((base32 >> 16) & 0xFFFFu);
 			h->r6c[idx] = 0xFFFF0000u | (((base32 >> 16) & 0xFFFFu) + 1u);
 		} else {
-			h->r48[idx] = (h->or48 & ~BIT(5)) | BIT(5);
 			h->r60[idx] = (((base32 >> 16) & 0xFF00u) + 1u) << 16 | ((base32 >> 16) & 0xFF00u);
 			h->r6c[idx] = 0xFFFFFF00u;
 		}
@@ -2099,15 +2307,15 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 		 * secondary 4E/4F controller selects an active-low BIOS-range bit
 		 * from its physical address.
 		 */
-		mask = idx == 0 ? BIT(0) :
+		/* The MMIO switch uses address-selected BIOS decode masks.
+		 * Legacy shared memory only gates the existing generic range. */
+		mask = !switch_mmio || idx == 0 ? BIT(0) :
 			_intel_bios_mask_for_data_space(base32);
-		if (!mask && idx == 1)
+		if (!mask && switch_mmio && idx == 1)
 			mask = _intel_bios_mask_for_feat_space(base32);
 		if (!mask)
 			return -EINVAL;
-		/* Bit 0 enables the generic memory range; clearing D8 routes it. */
 		h->r98[idx] = base32 | 1u;
-		h->rd8[idx] = h->ord8 & ~(u32)mask;
 	} else {
 		return -ENODEV;
 	}
@@ -2115,29 +2323,135 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 	/* Commit the slot only after every vendor-specific value is valid. */
 	h->base[idx] = base32;
 	h->have[idx] = true;
+	h->switch_mmio[idx] = switch_mmio;
 
+	return 0;
+}
+
+static int it87_h2_slot_matches(struct it87_h2ram_handle *h, int idx,
+				bool *matches)
+{
+	void __iomem *hb;
+	u32 value;
+	int ret;
+
+	*matches = false;
+	if (h->is_amd) {
+		ret = pci_reg_read(h->bridge, 0x48, &value);
+		if (ret || !(value & BIT(5)))
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x60, &value);
+		if (ret || value != h->r60[idx])
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x6C, &value);
+		if (ret || value != h->r6c[idx])
+			return ret;
+	} else if (h->is_intel) {
+		ret = pci_reg_read(h->bridge, 0xD8, &value);
+		if (ret || ((value ^ h->rd8[idx]) &
+			    it87_intel_owned_decode_mask(h)))
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x98, &value);
+		if (ret || ((value ^ h->r98[idx]) & 0xffff0001u))
+			return ret;
+		/* The legacy shared-memory API checks public PCI D8[0]/98[0]
+		 * only; an already enabled window must not be disturbed simply
+		 * because a private PCR mirror differs. */
+		if (h->hidden_ready && h->switch_mmio[idx]) {
+			hb = ioremap(h->hidden_base, 0x200);
+			if (!hb)
+				return -ENOMEM;
+			if (!((readl(hb + 0x40) ^ h->r98[idx]) &
+			       0xffff0001u) &&
+			    !((readl(hb + 0x44) ^ h->rd8[idx]) &
+			      it87_intel_owned_decode_mask(h)))
+				*matches = true;
+			iounmap(hb);
+			return 0;
+		}
+	}
+	*matches = true;
 	return 0;
 }
 
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 {
-	if (!h || !h->bridge)return -ENODEV;
-	if (idx<0 || idx>1)return -EINVAL;
-	if (!h->have[idx])return -ENOENT;
+	bool matches;
+	u32 value;
+	u16 mask;
+	int ret;
 
-	/* Program window on demand for all vendors */
-	if (h->current_base != h->base[idx]) {
-		return _enable_slot(h, idx);
+	if (!h || !h->bridge)
+		return -ENODEV;
+	if (idx < 0 || idx > 1)
+		return -EINVAL;
+	if (!h->have[idx])
+		return -ENOENT;
+	if (!h->saved || (h->suspended_slots & BIT(idx)))
+		return -EBUSY;
+
+	if (h->is_intel) {
+		ret = it87_intel_select_hidden(h, idx);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0xD8, &value);
+		if (ret)
+			return ret;
+		if (!h->switch_mmio[idx]) {
+			/* Legacy shared memory toggles D8[0] and
+			 * 98[0], retaining the firmware-programmed 98 base. */
+			h->rd8[idx] = value & ~BIT(0);
+			ret = pci_reg_read(h->bridge, 0x98, &value);
+			if (ret)
+				return ret;
+			/* No existing generic range: do not enable a zero address. */
+			if (!(value & 0xffff0000u))
+				return -ENODEV;
+			h->r98[idx] = value | BIT(0);
+		} else {
+			mask = h->have[idx ^ 1] ?
+				it87_intel_active_mask(h, idx ^ 1) : 0;
+			value |= mask;
+			mask = it87_intel_active_mask(h, idx);
+			if (!idx && it87_intel_primary_generic(h->base[idx]))
+				h->rd8[idx] = value | mask;
+			else
+				h->rd8[idx] = value & ~mask;
+		}
+	}
+
+	ret = it87_h2_slot_matches(h, idx, &matches);
+	if (ret)
+		return ret;
+	if (matches) {
+		h->current_slot = idx + 1;
+		return 0;
+	}
+
+	ret = _enable_slot(h, idx);
+	if (ret)
+		return ret;
+	ret = it87_h2_slot_matches(h, idx, &matches);
+	if (ret || !matches) {
+		if (_restore_regs(h))
+			pr_warn("bridge state could not be restored after verification failure\n");
+		return ret ? ret : -EIO;
 	}
 	return 0;
 }
 
+
 static void it87_h2_release(struct it87_h2ram_handle *h)
 {
+	int ret;
+
 	if (!h || !h->bridge)
 		return;
 
-	_restore_regs(h);
+	ret = _restore_regs(h);
+	if (ret)
+		pr_warn("bridge restore failed during release (%d); hardware state may remain modified\n",
+			ret);
 	pci_disable_device(h->bridge);
 	pci_dev_put(h->bridge);
 	memset(h, 0, sizeof(*h));
@@ -2158,7 +2472,8 @@ static int it87_h2_global_init(void)
 }
 
 /* Configure a slot (just updates state, does not touch PCI yet) */
-static int it87_h2_global_set_slot(int idx, u64 mmio_base)
+static int it87_h2_global_set_slot(int idx, u64 mmio_base,
+				   bool switch_mmio)
 {
 	int ret;
 
@@ -2166,7 +2481,8 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 	if (!it87_h2_global_ready)
 		ret = -ENODEV;
 	else
-		ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+		ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base,
+					      switch_mmio);
 	mutex_unlock(&mmio_lock);
 
 	return ret;
@@ -2183,13 +2499,79 @@ static int it87_h2_global_use_slot(int idx)
 	return ret;
 }
 
-/* Firmware/PCI resume may have changed the bridge behind our cache. */
-static void it87_h2_global_invalidate(void)
+/* Keep the shared bridge active until the last bound controller suspends. */
+static int it87_h2_global_suspend(int idx)
 {
+	struct it87_h2ram_handle *h = &it87_h2_global;
+	u8 slots = 0;
+	int ret = 0;
+	int i;
+
+	if (idx < 0 || idx > 1)
+		return -EINVAL;
 	mutex_lock(&mmio_lock);
-	if (it87_h2_global_ready)
-		it87_h2_global.current_base = 0;
+	if (!it87_h2_global_ready || !h->have[idx]) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	for (i = 0; i < 2; i++) {
+		if (h->have[i] && it87_pdev[i] &&
+		    device_is_bound(&it87_pdev[i]->dev))
+			slots |= BIT(i);
+	}
+	h->suspended_slots |= BIT(idx);
+	if (h->suspended_slots == slots) {
+		ret = _restore_regs(h);
+		if (!ret)
+			h->saved = false;
+		else
+			h->suspended_slots &= ~BIT(idx);
+	}
+
+out:
 	mutex_unlock(&mmio_lock);
+	return ret;
+}
+
+static int it87_h2_global_resume(int idx)
+{
+	struct it87_h2ram_handle *h = &it87_h2_global;
+	int ret = 0;
+
+	if (idx < 0 || idx > 1)
+		return -EINVAL;
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready || !h->have[idx]) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	if (!h->saved) {
+		if (h->is_intel) {
+			u32 interface;
+
+			ret = pci_reg_read(h->bridge, 0xDC, &interface);
+			if (ret)
+				goto out;
+			h->intel_espi = !!(interface & BIT(2));
+			ret = it87_intel_init_hidden(h,
+					h->switch_mmio[0] || h->switch_mmio[1]);
+			if (ret)
+				goto out;
+		}
+
+		ret = _save_regs(h);
+		if (ret)
+			goto out;
+	}
+
+	h->current_slot = 0;
+	h->suspended_slots &= ~BIT(idx);
+
+out:
+	mutex_unlock(&mmio_lock);
+	return ret;
 }
 
 /* Fully release: restore PCI config, disable the bridge, and drop its ref. */
@@ -2743,11 +3125,15 @@ static int it87_bridge_read(struct it87_data *data, u16 reg)
 		(data->mmio_bridge || data->mmio_h2ram)) {
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 		int val = 0;
+		int ret;
 
 		mutex_lock(&mmio_lock);
 
-		if (it87_h2_global_ready &&
-		    !it87_h2_global_use_slot(slot))
+		ret = it87_h2_global_use_slot(slot);
+		if (ret)
+			pr_warn_ratelimited("bridge slot %d read 0x%04x failed: %d\n",
+					    slot, reg, ret);
+		else
 			val = it87_mmio_read(data, reg);
 
 		mutex_unlock(&mmio_lock);
@@ -2762,16 +3148,18 @@ static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 		!(data->features & FEAT_MMIO) &&
 		(data->mmio_bridge || data->mmio_h2ram)) {
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
+		int ret;
 
 		mutex_lock(&mmio_lock);
 
-		if (it87_h2_global_ready &&
-		    !it87_h2_global_use_slot(slot)) {
-			if (data->type == it8688 && it87_h2_global.intel_espi)
-				it87_espi_mmio_write(data, reg, value);
-			else
-				it87_mmio_write(data, reg, value);
-		}
+		ret = it87_h2_global_use_slot(slot);
+		if (ret)
+			pr_warn_ratelimited("bridge slot %d write 0x%04x failed: %d\n",
+					    slot, reg, ret);
+		else if (data->type == it8688 && it87_h2_global.intel_espi)
+			it87_espi_mmio_write(data, reg, value);
+		else
+			it87_mmio_write(data, reg, value);
 
 		mutex_unlock(&mmio_lock);
 	}
@@ -7189,6 +7577,10 @@ static int it87_suspend(struct device *dev)
 	}
 
 	it87_unlock(data);
+
+	if (data->mmio_bridge ||
+	    (data->mmio_h2ram && !has_h2ram_direct(data)))
+		return it87_h2_global_suspend(data->sioaddr == REG_4E ? 1 : 0);
 	return 0;
 }
 
@@ -7200,8 +7592,11 @@ static int it87_resume(struct device *dev)
 	int pwm_safe;
 
 	if (data->mmio_bridge ||
-	    (data->mmio_h2ram && !has_h2ram_direct(data)))
-		it87_h2_global_invalidate();
+	    (data->mmio_h2ram && !has_h2ram_direct(data))) {
+		err = it87_h2_global_resume(data->sioaddr == REG_4E ? 1 : 0);
+		if (err)
+			return err;
+	}
 
 	it87_resume_sio(pdev);
 
@@ -7534,6 +7929,28 @@ static const struct dmi_system_id it87_dmi_table[] __initconst = {
 };
 MODULE_DEVICE_TABLE(dmi, it87_dmi_table);
 
+static bool it87_main_ec_mmio_enabled(const struct it87_sio_data *sio)
+{
+	if (!sio)
+		return false;
+
+	switch (sio->type) {
+	case it8688:
+	case it8689:
+	case it8696:
+	case it8698:
+		return sio->mmio || sio->mmio_bridge;
+	default:
+		return false;
+	}
+}
+
+static bool it87_select_mmio_switch(const struct it87_sio_data *sio,
+				    bool main_ec_mmio)
+{
+	return main_ec_mmio && (sio->mmio_bridge || sio->mmio_h2ram);
+}
+
 static int __init sm_it87_init(void)
 {
 	int                 sioaddr[2] = { REG_2E, REG_4E };
@@ -7541,6 +7958,7 @@ static int __init sm_it87_init(void)
 	unsigned short      isa_address[2];
 	phys_addr_t         mmio_address;
 	bool                found = false;
+	bool                main_ec_mmio_enabled = false;
 	int                 i, err;
 
 	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
@@ -7565,6 +7983,13 @@ static int __init sm_it87_init(void)
 						&sio_data, i);
 		if (err || isa_address[i]==0)
 			continue;
+
+		/* GCC chooses switched MMIO from the primary EC MMIO state,
+		 * not the SIV platform generation.  The discovery flags reflect
+		 * global SIO register 0x24 bit 5 and the controller model. */
+		if (i == 0)
+			main_ec_mmio_enabled =
+				it87_main_ec_mmio_enabled(&sio_data);
 
 		/*
 	 * Don't register second chip if its ISA address matches
@@ -7601,7 +8026,17 @@ static int __init sm_it87_init(void)
 			if (it87_h2_global_ready) {
 				/* Register the controller's address as slot 0=2E or slot 1=4E. */
 				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
-				ret = it87_h2_global_set_slot(slot, base);
+				/* MMIO-backed H2RAM uses the switch API when the primary
+				 * EC MMIO interface is enabled.  Otherwise legacy SMFI
+				 * sharing preserves the preconfigured generic PCI window. */
+				if (sio_data.mmio_bridge && !main_ec_mmio_enabled) {
+					pr_err("bridge-backed EC MMIO lacks an enabled primary EC MMIO gate\n");
+					err = -EOPNOTSUPP;
+					goto exit_unregister;
+				}
+				ret = it87_h2_global_set_slot(slot, base,
+						it87_select_mmio_switch(&sio_data,
+							main_ec_mmio_enabled));
 				if (ret) {
 					pr_err("H2RAM set_slot(%d,%pa) failed: %d\n",
 					       slot, &base, ret);
