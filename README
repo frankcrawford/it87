@@ -30,7 +30,6 @@ To install:
 
 Note that these labels are entirely optional.
 They're designed to give you appropriate sensor mappings and properly scaled voltage readouts.
-Also note that programs like Coolercontrol won't pick up these names.
 They're only read by applications aware of sensors.d configuration files.
 Finally, the old configs have been moved to "Sensors configs/old configs"
 for the older sensors.d maps of certain Gigabyte Motherboards.
@@ -156,6 +155,12 @@ Add USB2DACUP voltage setting and monitoring (for certain boards with this featu
 
 CHANGELOG:
 =========
+
+SUPPORT NOTE - Nov 2026
+============
+
+Fixes several issues with certain Intel MMIO bridges. Most newer boards won't see any functional changes.
+These fixes mostly affect boards in the 200 to 400 series intel chipsets.
 
 SUPPORT NOTE - Sep 2026
 ============
